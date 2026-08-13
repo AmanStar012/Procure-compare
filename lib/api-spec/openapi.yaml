@@ -1,0 +1,706 @@
+openapi: 3.1.0
+info:
+  # Do not change the title, if the title changes, the import paths will be broken
+  title: Api
+  version: 0.1.0
+  description: Vendor Quotation Comparison Tool API
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: projects
+    description: Comparison projects
+  - name: quotations
+    description: Vendor quotations
+  - name: comparison
+    description: Comparison and export
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      description: Returns server health status
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+
+  /projects:
+    get:
+      operationId: listProjects
+      tags: [projects]
+      summary: List all comparison projects
+      responses:
+        "200":
+          description: List of projects
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Project"
+    post:
+      operationId: createProject
+      tags: [projects]
+      summary: Create a new comparison project
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProjectInput"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+
+  /projects/{id}:
+    get:
+      operationId: getProject
+      tags: [projects]
+      summary: Get a project with its quotations
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: number
+      responses:
+        "200":
+          description: Project with quotations
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectDetail"
+        "404":
+          description: Not found
+    patch:
+      operationId: updateProject
+      tags: [projects]
+      summary: Update a project's name, description, or target categories
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: number
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateProjectInput"
+      responses:
+        "200":
+          description: Updated project
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "404":
+          description: Not found
+    delete:
+      operationId: deleteProject
+      tags: [projects]
+      summary: Delete a project
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: number
+      responses:
+        "204":
+          description: Deleted
+
+  /projects/{id}/quotations:
+    get:
+      operationId: listQuotations
+      tags: [quotations]
+      summary: List quotations for a project
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: number
+      responses:
+        "200":
+          description: List of quotations
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Quotation"
+
+  /projects/{id}/quotations/{qid}:
+    patch:
+      operationId: updateQuotation
+      tags: [quotations]
+      summary: Edit a quotation's extracted data (line items, vendor info, totals)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: number
+        - name: qid
+          in: path
+          required: true
+          schema:
+            type: number
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateQuotationInput"
+      responses:
+        "200":
+          description: Updated quotation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Quotation"
+        "404":
+          description: Not found
+    delete:
+      operationId: deleteQuotation
+      tags: [quotations]
+      summary: Remove a quotation from a project
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: number
+        - name: qid
+          in: path
+          required: true
+          schema:
+            type: number
+      responses:
+        "204":
+          description: Deleted
+
+  /projects/{id}/quotations/{qid}/set-benchmark:
+    post:
+      operationId: setBenchmark
+      tags: [quotations]
+      summary: Set a quotation as the benchmark for the project
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: number
+        - name: qid
+          in: path
+          required: true
+          schema:
+            type: number
+      responses:
+        "200":
+          description: Updated project
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+
+  /projects/{id}/comparison:
+    get:
+      operationId: getComparison
+      tags: [comparison]
+      summary: Get the comparison table data for a project
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: number
+      responses:
+        "200":
+          description: Comparison data
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ComparisonResult"
+        "404":
+          description: Not found
+
+  /projects/{id}/summary:
+    get:
+      operationId: getProjectSummary
+      tags: [comparison]
+      summary: Get summary stats for a project (vendor count, item count, lowest/highest totals)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: number
+      responses:
+        "200":
+          description: Summary stats
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectSummary"
+
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+
+    CustomColumn:
+      type: object
+      required: [id, label]
+      description: An extra shared column added in the grid editor, applied uniformly across every vendor/category (e.g. "Brand", "Delivery Days")
+      properties:
+        id:
+          type: string
+        label:
+          type: string
+
+    ColumnLabels:
+      type: object
+      description: Overrides for the built-in comparison table headers. Omitted keys keep their default label.
+      properties:
+        spec:
+          type: string
+        qty:
+          type: string
+        mrp:
+          type: string
+        unitPrice:
+          type: string
+        discountPercent:
+          type: string
+        totalPrice:
+          type: string
+
+    Project:
+      type: object
+      required: [id, name, targetItems, customColumns, columnLabels, createdAt, quotationCount, benchmarkQuotationId]
+      properties:
+        id:
+          type: number
+        name:
+          type: string
+        description:
+          type: ["string", "null"]
+        targetItems:
+          type: array
+          items:
+            type: string
+          description: Canonical categories to compare across vendors (e.g. "Steam Generator", "Control Panel")
+        customColumns:
+          type: array
+          items:
+            $ref: "#/components/schemas/CustomColumn"
+        columnLabels:
+          $ref: "#/components/schemas/ColumnLabels"
+        createdAt:
+          type: string
+        quotationCount:
+          type: number
+        benchmarkQuotationId:
+          type: ["number", "null"]
+
+    ProjectInput:
+      type: object
+      required: [name, targetItems]
+      properties:
+        name:
+          type: string
+          minLength: 1
+        description:
+          type: string
+        targetItems:
+          type: array
+          items:
+            type: string
+          minItems: 1
+
+    UpdateProjectInput:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+        description:
+          type: string
+        targetItems:
+          type: array
+          items:
+            type: string
+          minItems: 1
+        customColumns:
+          type: array
+          items:
+            $ref: "#/components/schemas/CustomColumn"
+        columnLabels:
+          $ref: "#/components/schemas/ColumnLabels"
+
+    ProjectDetail:
+      type: object
+      required: [id, name, targetItems, customColumns, columnLabels, createdAt, quotations, benchmarkQuotationId]
+      properties:
+        id:
+          type: number
+        name:
+          type: string
+        description:
+          type: ["string", "null"]
+        targetItems:
+          type: array
+          items:
+            type: string
+        customColumns:
+          type: array
+          items:
+            $ref: "#/components/schemas/CustomColumn"
+        columnLabels:
+          $ref: "#/components/schemas/ColumnLabels"
+        createdAt:
+          type: string
+        benchmarkQuotationId:
+          type: ["number", "null"]
+        quotations:
+          type: array
+          items:
+            $ref: "#/components/schemas/Quotation"
+
+    Quotation:
+      type: object
+      required: [id, projectId, vendorName, fileName, fileType, status, isBenchmark, createdAt]
+      properties:
+        id:
+          type: number
+        projectId:
+          type: number
+        vendorName:
+          type: string
+        fileName:
+          type: string
+        fileType:
+          type: string
+        status:
+          type: string
+          enum: [pending, parsing, done, error]
+        isBenchmark:
+          type: boolean
+        parsedData:
+          type: ["string", "null"]
+          description: JSON-encoded parsed quotation data
+        errorMessage:
+          type: ["string", "null"]
+        createdAt:
+          type: string
+
+    ItemFormat:
+      type: object
+      description: Text styling for a single cell, carried through to the Excel export
+      properties:
+        bold:
+          type: boolean
+        italic:
+          type: boolean
+        underline:
+          type: boolean
+        highlight:
+          type: boolean
+
+    ItemFormatMap:
+      type: object
+      description: Per-column formatting for a line item, keyed by field name (vendorItemName, spec, quantity, mrp, unitPrice, discountPercent, totalPrice) or a custom column id
+      additionalProperties:
+        $ref: "#/components/schemas/ItemFormat"
+
+    EditableItem:
+      type: object
+      required: [vendorItemName, quantity, unitPrice, totalPrice]
+      properties:
+        matchedCategory:
+          type: ["string", "null"]
+          description: Category this item belongs to, or null to leave it in "Other items"
+        vendorItemName:
+          type: string
+        spec:
+          type: ["string", "null"]
+        quantity:
+          type: number
+        mrp:
+          type: ["number", "null"]
+        unitPrice:
+          type: number
+        discountPercent:
+          type: ["number", "null"]
+        totalPrice:
+          type: number
+        format:
+          $ref: "#/components/schemas/ItemFormatMap"
+        customFields:
+          type: object
+          additionalProperties:
+            type: string
+          description: Values for the project's custom shared columns, keyed by CustomColumn id
+
+    UpdateQuotationInput:
+      type: object
+      description: Partial edit of a quotation's extracted data. Omitted fields are left unchanged; when "items" is provided it fully replaces the existing line items.
+      properties:
+        vendorName:
+          type: ["string", "null"]
+        vendorAddress:
+          type: ["string", "null"]
+        vendorContact:
+          type: ["string", "null"]
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/EditableItem"
+        additionalInfo:
+          type: object
+          properties:
+            designingCharges:
+              type: ["string", "null"]
+            gst:
+              type: ["string", "null"]
+            installation:
+              type: ["string", "null"]
+            freight:
+              type: ["string", "null"]
+            leadTime:
+              type: ["string", "null"]
+            samplesForReview:
+              type: ["string", "null"]
+            paymentSchedule:
+              type: ["string", "null"]
+            warranty:
+              type: ["string", "null"]
+        grandTotal:
+          type: ["number", "null"]
+
+    VendorLineItem:
+      type: object
+      required: [vendorItemName, quantity, unitPrice, totalPrice]
+      properties:
+        vendorItemName:
+          type: string
+          description: What the vendor actually called this specific line item
+        spec:
+          type: ["string", "null"]
+          description: This line's capacity/size/model spec, e.g. "10 X 3 INCH"
+        quantity:
+          type: number
+        mrp:
+          type: ["number", "null"]
+        unitPrice:
+          type: number
+        discountPercent:
+          type: ["number", "null"]
+        totalPrice:
+          type: number
+        format:
+          $ref: "#/components/schemas/ItemFormatMap"
+        customFields:
+          type: object
+          additionalProperties:
+            type: string
+
+    VendorRow:
+      type: object
+      required: [quotationId, vendorName, available, lineItems]
+      properties:
+        quotationId:
+          type: number
+        vendorName:
+          type: string
+        vendorItemName:
+          type: ["string", "null"]
+          description: What the vendor called this item. Null when the category matched multiple differently-named line items (see lineItems).
+        spec:
+          type: ["string", "null"]
+          description: This vendor's capacity/size/model spec for the item, e.g. "9 KW". Null when multiple variants with different specs matched this category.
+        quantity:
+          type: ["number", "null"]
+          description: Total quantity across all matched line items for this category
+        mrp:
+          type: ["number", "null"]
+          description: Null when matched line items have differing MRPs (see lineItems for the breakdown)
+        unitPrice:
+          type: ["number", "null"]
+          description: Unit price after discount. Null when matched line items have differing rates (see lineItems for the breakdown)
+        discountPercent:
+          type: ["number", "null"]
+        totalPrice:
+          type: ["number", "null"]
+          description: Total price summed across all matched line items for this category
+        available:
+          type: boolean
+        lineItems:
+          type: array
+          items:
+            $ref: "#/components/schemas/VendorLineItem"
+          description: Individual line items this vendor matched to the category. Length > 1 means the vendor quoted multiple size/variant options under one category (e.g. multiple nameplate sizes) — the fields above are aggregated totals across these.
+
+    ComparisonRow:
+      type: object
+      required: [category, vendors]
+      properties:
+        category:
+          type: string
+          description: Canonical category from the project's targetItems list
+        vendors:
+          type: array
+          items:
+            $ref: "#/components/schemas/VendorRow"
+
+    OtherItem:
+      type: object
+      required: [quotationId, vendorName, vendorItemName, quantity, unitPrice, totalPrice]
+      properties:
+        quotationId:
+          type: number
+        vendorName:
+          type: string
+        vendorItemName:
+          type: string
+        spec:
+          type: ["string", "null"]
+        quantity:
+          type: number
+        mrp:
+          type: ["number", "null"]
+        unitPrice:
+          type: number
+        discountPercent:
+          type: ["number", "null"]
+        totalPrice:
+          type: number
+        format:
+          $ref: "#/components/schemas/ItemFormatMap"
+        customFields:
+          type: object
+          additionalProperties:
+            type: string
+
+    AdditionalVendorValue:
+      type: object
+      required: [quotationId, vendorName]
+      properties:
+        quotationId:
+          type: number
+        vendorName:
+          type: string
+        value:
+          type: ["string", "null"]
+
+    ComparisonAdditional:
+      type: object
+      required: [label, vendors]
+      properties:
+        label:
+          type: string
+        vendors:
+          type: array
+          items:
+            $ref: "#/components/schemas/AdditionalVendorValue"
+
+    GrandTotal:
+      type: object
+      required: [quotationId, vendorName]
+      properties:
+        quotationId:
+          type: number
+        vendorName:
+          type: string
+        total:
+          type: ["number", "null"]
+
+    VendorDetail:
+      type: object
+      required: [quotationId, vendorName, isBenchmark]
+      properties:
+        quotationId:
+          type: number
+        vendorName:
+          type: string
+        vendorAddress:
+          type: ["string", "null"]
+        vendorContact:
+          type: ["string", "null"]
+        isBenchmark:
+          type: boolean
+
+    ComparisonResult:
+      type: object
+      required: [projectId, vendors, vendorDetails, rows, otherItems, additionalInfo, grandTotals]
+      properties:
+        projectId:
+          type: number
+        vendors:
+          type: array
+          items:
+            $ref: "#/components/schemas/Quotation"
+        vendorDetails:
+          type: array
+          items:
+            $ref: "#/components/schemas/VendorDetail"
+        rows:
+          type: array
+          items:
+            $ref: "#/components/schemas/ComparisonRow"
+        otherItems:
+          type: array
+          items:
+            $ref: "#/components/schemas/OtherItem"
+          description: Vendor line items that didn't match any of the project's target categories
+        additionalInfo:
+          type: array
+          items:
+            $ref: "#/components/schemas/ComparisonAdditional"
+        grandTotals:
+          type: array
+          items:
+            $ref: "#/components/schemas/GrandTotal"
+
+    ProjectSummary:
+      type: object
+      required: [projectId, vendorCount, itemCount, hasBenchmark, parsedCount, pendingCount]
+      properties:
+        projectId:
+          type: number
+        vendorCount:
+          type: number
+        itemCount:
+          type: number
+        hasBenchmark:
+          type: boolean
+        lowestTotal:
+          type: ["number", "null"]
+        highestTotal:
+          type: ["number", "null"]
+        lowestVendor:
+          type: ["string", "null"]
+        highestVendor:
+          type: ["string", "null"]
+        parsedCount:
+          type: number
+        pendingCount:
+          type: number
