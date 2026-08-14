@@ -65,6 +65,10 @@ Rules:
 - Set "vendorItemName" to the item's name exactly as written in the document.
 - Set "spec" to any capacity/size/model detail that distinguishes this item (e.g. "9 KW", "12x3 inch"), or null if none.
 - Extract "mrp" (list price before discount) and "discountPercent" when shown, separately from "unitPrice" (the price after discount). Use null for any that aren't shown.
+- Some items (e.g. windows/glass/fabric priced by area) show TWO different rate figures: a per-area rate (e.g. "Value per Sq.Ft.", "Rate per Sq.Mtr.") and a separate per-unit price (e.g. "Unit Price") that already equals that per-area rate × the item's area. Always use the per-unit price — the one that actually multiplies with "quantity" (the count of pieces/windows/Nos) to approximate the item's total — for "unitPrice". Do not use the smaller per-area rate just because it looks like "the" rate; that figure belongs in "spec" as context (e.g. "23.98 sqft/window @ ₹968.55/sqft"), not in "unitPrice".
+- Set "quantity" to exactly the number in the document's own quantity/qty/nos column for that line item. Never compute or infer a quantity from unrelated numbers elsewhere in the description — e.g. an area calculation like "13x9=117 sqft" inside an item's description is NOT the quantity unless the quantity column itself says 117. Put that kind of detail in "spec" instead, and copy the quantity column's value as-is, even if it's just "1".
+- Set "totalPrice" to exactly the amount/total the document states for that line item. Do not calculate it yourself as quantity × unitPrice — vendors sometimes price per a different unit than the quantity column (e.g. rate given per sqft while quantity is in Nos), so the two won't always multiply out.
+- Documents may be provided as HTML with <table> markup. Some vendor tables cram multiple line items into a single table cell as several stacked paragraphs instead of using separate rows (e.g. one cell holding several stacked quantities for several different items, aligned by position with stacked descriptions in another cell). When you see this, match paragraphs by their position/order within each column — the Nth paragraph in one cell corresponds to the Nth paragraph in another — and ignore stray blank paragraphs. Still extract EVERY line item exactly once, even when the correspondence between columns takes judgment; don't drop an item just because its cell alignment isn't perfectly explicit.
 - Prices should be numbers only (no currency symbols).
 - Pay close attention to table columns — do not merge or misalign values from adjacent columns or rows.
 - If a value is missing or unclear, use null.`;
@@ -91,12 +95,12 @@ function buildExtractionTool(targetItems: string[]): Anthropic.Tool {
                 description: "Which target category this item corresponds to, or null if it doesn't match any",
               },
               vendorItemName: { type: "string", description: "Item name exactly as written by the vendor" },
-              spec: { type: ["string", "null"], description: "Capacity/size/model spec, e.g. '9 KW'" },
-              quantity: { type: "number" },
+              spec: { type: ["string", "null"], description: "Capacity/size/model spec, e.g. '9 KW'. Also the place for area/size math (e.g. '13x9=117 sqft') found in the description — that is NOT the quantity." },
+              quantity: { type: "number", description: "The number from the document's own quantity/qty/nos column for this line item, copied exactly — never inferred or computed from other figures" },
               mrp: { type: ["number", "null"], description: "List price before discount" },
-              unitPrice: { type: "number", description: "Price per unit after discount" },
+              unitPrice: { type: "number", description: "Price per unit (piece/window/Nos) after discount. If the document also shows a per-area rate like 'Value per Sq.Ft.', that is NOT this — use the per-unit price instead (the one that multiplies with quantity to give the total)." },
               discountPercent: { type: ["number", "null"] },
-              totalPrice: { type: "number" },
+              totalPrice: { type: "number", description: "The amount/total the document states for this line item, copied exactly — not computed as quantity × unitPrice" },
             },
             required: ["matchedCategory", "vendorItemName", "spec", "quantity", "mrp", "unitPrice", "discountPercent", "totalPrice"],
           },

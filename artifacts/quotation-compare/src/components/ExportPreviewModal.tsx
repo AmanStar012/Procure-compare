@@ -34,6 +34,10 @@ const LABEL_TO_KEY: Record<string, string> = Object.fromEntries(
 )
 const ADDITIONAL_INFO_KEYS = Object.keys(ADDITIONAL_INFO_LABELS)
 
+// Additional-info fields that represent a monetary charge (flat ₹ amount or a
+// "%" applied to the items subtotal) and therefore feed into the Grand Total.
+const CHARGE_KEYS = ["gst", "freight", "installation"] as const
+
 const DEFAULT_COL_LABELS: Record<keyof ColumnLabels, string> = {
   spec: "Item / Spec",
   qty: "Qty",
@@ -43,6 +47,20 @@ const DEFAULT_COL_LABELS: Record<keyof ColumnLabels, string> = {
   totalPrice: "Total",
 }
 const BUILTIN_COL_KEYS = Object.keys(DEFAULT_COL_LABELS) as (keyof ColumnLabels)[]
+
+// Fixed pixel widths shared by the header row and every vendor's item rows —
+// this is what keeps columns lined up under their headers (previously each
+// used independent, mismatched % widths inside separate <table> elements).
+const CATEGORY_COL_WIDTH = 180
+const COL_WIDTH: Record<keyof ColumnLabels, number> = {
+  spec: 220,
+  qty: 60,
+  mrp: 84,
+  unitPrice: 84,
+  discountPercent: 70,
+  totalPrice: 100,
+}
+const CUSTOM_COL_WIDTH = 96
 
 interface ItemFormatState {
   bold?: boolean
@@ -160,6 +178,32 @@ const fmt = (n: number | null | undefined) => {
   return "₹ " + new Intl.NumberFormat("en-IN").format(n)
 }
 
+// Comma-grouped display for a numeric cell, e.g. 31463.41 -> "31,463.41".
+const formatNumberForDisplay = (value: string | number | null | undefined) => {
+  if (value === "" || value == null) return ""
+  const num = typeof value === "number" ? value : Number(value)
+  if (Number.isNaN(num)) return String(value)
+  return new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2 }).format(num)
+}
+
+// Best-effort read of a free-text additional-info field (e.g. "18%", "₹2,000",
+// "Included") as a monetary contribution — a "%" is applied against the items
+// subtotal, a plain number is taken as a flat amount, anything else is 0.
+const parseChargeAmount = (raw: string | null | undefined, base: number): number => {
+  if (!raw) return 0
+  const percentMatch = raw.match(/(-?\d[\d,]*\.?\d*)\s*%/)
+  if (percentMatch) return (base * parseFloat(percentMatch[1].replace(/,/g, ""))) / 100
+  const flatMatch = raw.match(/(-?\d[\d,]*\.?\d*)/)
+  if (flatMatch) return parseFloat(flatMatch[1].replace(/,/g, ""))
+  return 0
+}
+
+const computeGrandTotal = (v: DraftVendor): number => {
+  const itemsSubtotal = v.items.reduce((sum, it) => sum + (it.totalPrice || 0), 0)
+  const extra = CHARGE_KEYS.reduce((sum, k) => sum + parseChargeAmount(v.additionalInfo[k], itemsSubtotal), 0)
+  return Math.round((itemsSubtotal + extra) * 100) / 100
+}
+
 const formatClasses = (f: ItemFormatState | undefined) =>
   [
     f?.bold ? "font-bold" : "",
@@ -173,6 +217,169 @@ const numCell = textCell + " text-right tabular-nums"
 
 let colSeq = 0
 const nextColId = () => `col-${Date.now()}-${colSeq++}`
+
+// ── Cell components (module scope — see note below) ────────────────────────
+// FormatCell/CategorySelect/CustomFieldCells used to be declared *inside*
+// ExportPreviewModal's render body. That meant a brand-new function (and thus
+// a brand-new React component "type") on every keystroke, so React unmounted
+// and remounted the underlying <input> on every change — killing focus mid-type.
+// That's why typing felt broken enough that the native number spinner's
+// increment/decrement clicks (which don't rely on sustained focus) became the
+// workaround. Declaring them here, at module scope, keeps the component type
+// stable across renders so React only updates props in place.
+
+interface FormatCellProps {
+  qid: number
+  item: DraftItem
+  field: string
+  value: string | number
+  onChange: (raw: string) => void
+  onToggleFormat: (qid: number, key: string, field: string, flag: keyof ItemFormatState) => void
+  type?: "text" | "number"
+  placeholder?: string
+  inputClassName?: string
+}
+
+// One value input + a tiny per-column B/I/U/highlight toolbar that only shows on
+// hover/focus of THIS cell — so formatting targets one column, not the whole row.
+function FormatCell({
+  qid, item, field, value, onChange, onToggleFormat, type = "text", placeholder, inputClassName = "",
+}: FormatCellProps) {
+  const [focused, setFocused] = useState(false)
+  const [draftText, setDraftText] = useState("")
+  const isNumber = type === "number"
+  const f = item.format[field]
+  const base = isNumber ? numCell : textCell
+  const btnClass = (active: boolean | undefined, activeClass: string) =>
+    `p-[1px] rounded ${active ? activeClass : "text-muted-foreground/40 hover:text-foreground"}`
+  // While focused, show exactly what's being typed (draftText) rather than the
+  // parent's round-tripped number — otherwise e.g. a trailing "." gets stripped
+  // on every keystroke and you can never type a decimal. Comma formatting only
+  // applies once you click away.
+  const displayValue = isNumber ? (focused ? draftText : formatNumberForDisplay(value)) : value
+  return (
+    <div className="group/fc relative">
+      <input
+        type="text"
+        inputMode={isNumber ? "decimal" : undefined}
+        value={displayValue}
+        onFocus={() => {
+          setFocused(true)
+          setDraftText(value === "" || value == null ? "" : String(value))
+        }}
+        onBlur={() => setFocused(false)}
+        onChange={(e) => {
+          if (isNumber) {
+            const cleaned = e.target.value.replace(/[^0-9.-]/g, "")
+            setDraftText(cleaned)
+            onChange(cleaned)
+          } else {
+            onChange(e.target.value)
+          }
+        }}
+        placeholder={placeholder}
+        className={`${base} ${formatClasses(f)} ${inputClassName}`}
+      />
+      <div className="flex items-center gap-0.5 justify-end h-3 opacity-0 group-hover/fc:opacity-100 group-focus-within/fc:opacity-100 transition-opacity">
+        <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => onToggleFormat(qid, item.key, field, "bold")} title="Bold" className={btnClass(f?.bold, "bg-primary/20 text-primary")}>
+          <Bold className="w-2 h-2" />
+        </button>
+        <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => onToggleFormat(qid, item.key, field, "italic")} title="Italic" className={btnClass(f?.italic, "bg-primary/20 text-primary")}>
+          <Italic className="w-2 h-2" />
+        </button>
+        <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => onToggleFormat(qid, item.key, field, "underline")} title="Underline" className={btnClass(f?.underline, "bg-primary/20 text-primary")}>
+          <Underline className="w-2 h-2" />
+        </button>
+        <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => onToggleFormat(qid, item.key, field, "highlight")} title="Highlight" className={btnClass(f?.highlight, "bg-yellow-200 text-yellow-800")}>
+          <Highlighter className="w-2 h-2" />
+        </button>
+      </div>
+    </div>
+  )
+}
+
+// Standalone comma-formatted number input (no per-cell B/I/U toolbar) — used
+// for the Grand Total row. Shares FormatCell's focus/draft-text behavior.
+function PlainNumberInput({
+  value, onChange, className,
+}: {
+  value: string | number
+  onChange: (raw: string) => void
+  className?: string
+}) {
+  const [focused, setFocused] = useState(false)
+  const [draftText, setDraftText] = useState("")
+  const displayValue = focused ? draftText : formatNumberForDisplay(value)
+  return (
+    <input
+      type="text"
+      inputMode="decimal"
+      value={displayValue}
+      onFocus={() => {
+        setFocused(true)
+        setDraftText(value === "" || value == null ? "" : String(value))
+      }}
+      onBlur={() => setFocused(false)}
+      onChange={(e) => {
+        const cleaned = e.target.value.replace(/[^0-9.-]/g, "")
+        setDraftText(cleaned)
+        onChange(cleaned)
+      }}
+      className={className}
+    />
+  )
+}
+
+function CategorySelect({
+  qid, item, categoryOptions, onChange,
+}: {
+  qid: number
+  item: DraftItem
+  categoryOptions: { value: string; label: string }[]
+  onChange: (qid: number, key: string, value: string | null) => void
+}) {
+  return (
+    <select
+      className="w-full bg-transparent border-0 text-[10px] text-muted-foreground focus:outline-none"
+      value={item.matchedCategory ?? ""}
+      onChange={(e) => onChange(qid, item.key, e.target.value || null)}
+      title="Move to a different comparison line"
+    >
+      <option value="">— Other —</option>
+      {categoryOptions.map((opt) => (
+        <option key={opt.value} value={opt.value}>{opt.label}</option>
+      ))}
+    </select>
+  )
+}
+
+function CustomFieldCells({
+  qid, item, customColumns, onChange, onToggleFormat,
+}: {
+  qid: number
+  item: DraftItem
+  customColumns: CustomColumn[]
+  onChange: (qid: number, key: string, colId: string, value: string) => void
+  onToggleFormat: FormatCellProps["onToggleFormat"]
+}) {
+  return (
+    <>
+      {customColumns.map((col) => (
+        <td key={col.id}>
+          <FormatCell
+            qid={qid}
+            item={item}
+            field={col.id}
+            value={item.customFields[col.id] ?? ""}
+            onChange={(v) => onChange(qid, item.key, col.id, v)}
+            onToggleFormat={onToggleFormat}
+            placeholder="-"
+          />
+        </td>
+      ))}
+    </>
+  )
+}
 
 // ── Component ─────────────────────────────────────────────────────────────────
 export function ExportPreviewModal({ open, onClose, comparison, project, projectId, basePath }: Props) {
@@ -198,6 +405,14 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
   const [projectMetaDirty, setProjectMetaDirty] = useState(false)
 
   const colsPerVendor = 6 + customColumns.length
+
+  // Shared fixed-width layout — same numbers drive the header's <colgroup> and
+  // every vendor's item <table>, which is what keeps them aligned (see COL_WIDTH).
+  const vendorBlockWidth = useMemo(
+    () => BUILTIN_COL_KEYS.reduce((sum, k) => sum + COL_WIDTH[k], 0) + customColumns.length * CUSTOM_COL_WIDTH,
+    [customColumns.length]
+  )
+  const tableWidth = CATEGORY_COL_WIDTH + doneVendors.length * vendorBlockWidth
 
   const categoryOptions = useMemo(
     () => comparison.rows.map((r, i) => ({ value: r.category, label: categories[i] ?? r.category })),
@@ -254,12 +469,31 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
   }
 
   const updateItemField = <K extends keyof DraftItem>(qid: number, key: string, field: K, value: DraftItem[K]) => {
-    setDraft((prev) => ({
-      ...prev,
-      [qid]: { ...prev[qid], items: prev[qid].items.map((it) => (it.key === key ? { ...it, [field]: value } : it)) },
-    }))
+    setDraft((prev) => {
+      const vendor = prev[qid]
+      const items = vendor.items.map((it) => {
+        if (it.key !== key) return it
+        const updated = { ...it, [field]: value }
+        // Disc % is applied against MRP to derive Rate, which then flows into Total.
+        if ((field === "discountPercent" || field === "mrp") && updated.mrp != null) {
+          updated.unitPrice = Math.round(updated.mrp * (1 - (updated.discountPercent ?? 0) / 100) * 100) / 100
+        }
+        // Keep Total in sync with Qty × Rate so a vendor's stated total can be
+        // visually compared against the correct figure instead of trusted blindly.
+        // Total stays a normal editable field — typing in it directly still overrides.
+        if (field === "quantity" || field === "unitPrice" || field === "discountPercent" || field === "mrp") {
+          updated.totalPrice = Math.round(updated.quantity * updated.unitPrice * 100) / 100
+        }
+        return updated
+      })
+      const nextVendor = { ...vendor, items }
+      return { ...prev, [qid]: { ...nextVendor, grandTotal: computeGrandTotal(nextVendor) } }
+    })
     markDirty(qid)
   }
+
+  const setItemCategory = (qid: number, key: string, value: string | null) =>
+    updateItemField(qid, key, "matchedCategory", value)
 
   const toggleItemFormat = (qid: number, key: string, field: string, flag: keyof ItemFormatState) => {
     setDraft((prev) => ({
@@ -288,26 +522,36 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
   }
 
   const addItem = (qid: number, category: string | null) => {
-    setDraft((prev) => ({
-      ...prev,
-      [qid]: {
-        ...prev[qid],
-        items: [
-          ...prev[qid].items,
-          { key: nextKey(), matchedCategory: category, vendorItemName: "New item", spec: null, quantity: 1, mrp: null, unitPrice: 0, discountPercent: null, totalPrice: 0, format: {}, customFields: {} },
-        ],
-      },
-    }))
+    setDraft((prev) => {
+      const vendor = prev[qid]
+      const items = [
+        ...vendor.items,
+        { key: nextKey(), matchedCategory: category, vendorItemName: "New item", spec: null, quantity: 1, mrp: null, unitPrice: 0, discountPercent: null, totalPrice: 0, format: {}, customFields: {} },
+      ]
+      const nextVendor = { ...vendor, items }
+      return { ...prev, [qid]: { ...nextVendor, grandTotal: computeGrandTotal(nextVendor) } }
+    })
     markDirty(qid)
   }
 
   const removeItem = (qid: number, key: string) => {
-    setDraft((prev) => ({ ...prev, [qid]: { ...prev[qid], items: prev[qid].items.filter((it) => it.key !== key) } }))
+    setDraft((prev) => {
+      const vendor = prev[qid]
+      const items = vendor.items.filter((it) => it.key !== key)
+      const nextVendor = { ...vendor, items }
+      return { ...prev, [qid]: { ...nextVendor, grandTotal: computeGrandTotal(nextVendor) } }
+    })
     markDirty(qid)
   }
 
   const updateAdditionalInfo = (qid: number, field: string, value: string) => {
-    setDraft((prev) => ({ ...prev, [qid]: { ...prev[qid], additionalInfo: { ...prev[qid].additionalInfo, [field]: value === "" ? null : value } } }))
+    setDraft((prev) => {
+      const vendor = prev[qid]
+      const nextVendor = { ...vendor, additionalInfo: { ...vendor.additionalInfo, [field]: value === "" ? null : value } }
+      // GST/Freight/Installation feed the Grand Total (flat ₹ or a "%" of items subtotal).
+      const grandTotal = (CHARGE_KEYS as readonly string[]).includes(field) ? computeGrandTotal(nextVendor) : nextVendor.grandTotal
+      return { ...prev, [qid]: { ...nextVendor, grandTotal } }
+    })
     markDirty(qid)
   }
 
@@ -453,80 +697,23 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
 
   if (!open) return null
 
-  // One value input + a tiny per-column B/I/U/highlight toolbar that only shows on
-  // hover/focus of THIS cell — so formatting targets one column, not the whole row.
-  const FormatCell = ({
-    qid, item, field, value, onChange, type = "text", placeholder, inputClassName = "",
-  }: {
-    qid: number
-    item: DraftItem
-    field: string
-    value: string | number
-    onChange: (raw: string) => void
-    type?: "text" | "number"
-    placeholder?: string
-    inputClassName?: string
-  }) => {
-    const f = item.format[field]
-    const base = type === "number" ? numCell : textCell
-    const btnClass = (active: boolean | undefined, activeClass: string) =>
-      `p-[1px] rounded ${active ? activeClass : "text-muted-foreground/40 hover:text-foreground"}`
-    return (
-      <div className="group/fc relative">
-        <input
-          type={type}
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          placeholder={placeholder}
-          className={`${base} ${formatClasses(f)} ${inputClassName}`}
-        />
-        <div className="flex items-center gap-0.5 justify-end h-3 opacity-0 group-hover/fc:opacity-100 group-focus-within/fc:opacity-100 transition-opacity">
-          <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => toggleItemFormat(qid, item.key, field, "bold")} title="Bold" className={btnClass(f?.bold, "bg-primary/20 text-primary")}>
-            <Bold className="w-2 h-2" />
-          </button>
-          <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => toggleItemFormat(qid, item.key, field, "italic")} title="Italic" className={btnClass(f?.italic, "bg-primary/20 text-primary")}>
-            <Italic className="w-2 h-2" />
-          </button>
-          <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => toggleItemFormat(qid, item.key, field, "underline")} title="Underline" className={btnClass(f?.underline, "bg-primary/20 text-primary")}>
-            <Underline className="w-2 h-2" />
-          </button>
-          <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => toggleItemFormat(qid, item.key, field, "highlight")} title="Highlight" className={btnClass(f?.highlight, "bg-yellow-200 text-yellow-800")}>
-            <Highlighter className="w-2 h-2" />
-          </button>
-        </div>
-      </div>
-    )
-  }
-
-  const CategorySelect = ({ qid, item }: { qid: number; item: DraftItem }) => (
-    <select
-      className="w-full bg-transparent border-0 text-[10px] text-muted-foreground focus:outline-none"
-      value={item.matchedCategory ?? ""}
-      onChange={(e) => updateItemField(qid, item.key, "matchedCategory", e.target.value || null)}
-      title="Move to a different comparison line"
-    >
-      <option value="">— Other —</option>
-      {categoryOptions.map((opt) => (
-        <option key={opt.value} value={opt.value}>{opt.label}</option>
+  const ColGroup = () => (
+    <colgroup>
+      <col style={{ width: CATEGORY_COL_WIDTH }} />
+      {doneVendors.map((v) => (
+        <React.Fragment key={v.id}>
+          {BUILTIN_COL_KEYS.map((k) => <col key={k} style={{ width: COL_WIDTH[k] }} />)}
+          {customColumns.map((col) => <col key={col.id} style={{ width: CUSTOM_COL_WIDTH }} />)}
+        </React.Fragment>
       ))}
-    </select>
+    </colgroup>
   )
 
-  const CustomFieldCells = ({ qid, item }: { qid: number; item: DraftItem }) => (
-    <>
-      {customColumns.map((col) => (
-        <td key={col.id} className="w-[10%]">
-          <FormatCell
-            qid={qid}
-            item={item}
-            field={col.id}
-            value={item.customFields[col.id] ?? ""}
-            onChange={(v) => updateItemCustomField(qid, item.key, col.id, v)}
-            placeholder="-"
-          />
-        </td>
-      ))}
-    </>
+  const VendorColGroup = () => (
+    <colgroup>
+      {BUILTIN_COL_KEYS.map((k) => <col key={k} style={{ width: COL_WIDTH[k] }} />)}
+      {customColumns.map((col) => <col key={col.id} style={{ width: CUSTOM_COL_WIDTH }} />)}
+    </colgroup>
   )
 
   return createPortal(
@@ -573,11 +760,12 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
 
         {/* Scrollable table area */}
         <div className="flex-1 overflow-auto min-h-0">
-          <table className="w-full text-sm border-collapse">
+          <table className="text-sm border-collapse" style={{ width: tableWidth, tableLayout: "fixed" }}>
+            <ColGroup />
             <thead className="sticky top-0 z-20">
               {/* Vendor header row — editable name/address/contact */}
               <tr>
-                <th className="sticky left-0 z-30 bg-[#1F4E79] text-white text-left px-3 py-2 font-semibold border border-white/20 min-w-[180px] align-bottom">
+                <th className="sticky left-0 z-30 bg-[#1F4E79] text-white text-left px-3 py-2 font-semibold border border-white/20 align-bottom">
                   Category
                 </th>
                 {doneVendors.map((v) => {
@@ -714,31 +902,32 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
                       const subtotal = items.reduce((sum, it) => sum + (it.totalPrice || 0), 0)
 
                       return (
-                        <td key={v.id} colSpan={colsPerVendor} className={`border-l p-0 ${vHidden ? "opacity-30" : ""}`}>
-                          <table className="w-full">
+                        <td key={v.id} colSpan={colsPerVendor} className={`border-l p-0 align-top ${vHidden ? "opacity-30" : ""}`}>
+                          <table style={{ width: vendorBlockWidth, tableLayout: "fixed" }}>
+                            <VendorColGroup />
                             <tbody>
                               {items.map((it) => (
                                 <tr key={it.key} className="border-b border-border/40 last:border-b-0 group/item">
-                                  <td className="w-[30%]">
-                                    <FormatCell qid={v.id} item={it} field="vendorItemName" value={it.vendorItemName} onChange={(v2) => updateItemField(v.id, it.key, "vendorItemName", v2)} placeholder="Item name" />
-                                    <FormatCell qid={v.id} item={it} field="spec" value={it.spec ?? ""} onChange={(v2) => updateItemField(v.id, it.key, "spec", v2 || null)} placeholder="Spec" inputClassName="text-muted-foreground" />
-                                    <CategorySelect qid={v.id} item={it} />
+                                  <td>
+                                    <FormatCell qid={v.id} item={it} field="vendorItemName" value={it.vendorItemName} onChange={(v2) => updateItemField(v.id, it.key, "vendorItemName", v2)} onToggleFormat={toggleItemFormat} placeholder="Item name" />
+                                    <FormatCell qid={v.id} item={it} field="spec" value={it.spec ?? ""} onChange={(v2) => updateItemField(v.id, it.key, "spec", v2 || null)} onToggleFormat={toggleItemFormat} placeholder="Spec" inputClassName="text-muted-foreground" />
+                                    <CategorySelect qid={v.id} item={it} categoryOptions={categoryOptions} onChange={setItemCategory} />
                                   </td>
-                                  <td className="w-[10%]"><FormatCell qid={v.id} item={it} field="quantity" type="number" value={it.quantity} onChange={(v2) => updateItemField(v.id, it.key, "quantity", Number(v2))} /></td>
-                                  <td className="w-[11%]"><FormatCell qid={v.id} item={it} field="mrp" type="number" value={it.mrp ?? ""} onChange={(v2) => updateItemField(v.id, it.key, "mrp", v2 === "" ? null : Number(v2))} /></td>
-                                  <td className="w-[11%]"><FormatCell qid={v.id} item={it} field="unitPrice" type="number" value={it.unitPrice} onChange={(v2) => updateItemField(v.id, it.key, "unitPrice", Number(v2))} /></td>
-                                  <td className="w-[9%]"><FormatCell qid={v.id} item={it} field="discountPercent" type="number" value={it.discountPercent ?? ""} onChange={(v2) => updateItemField(v.id, it.key, "discountPercent", v2 === "" ? null : Number(v2))} /></td>
-                                  <td className="w-[13%]">
+                                  <td><FormatCell qid={v.id} item={it} field="quantity" type="number" value={it.quantity} onChange={(v2) => updateItemField(v.id, it.key, "quantity", Number(v2))} onToggleFormat={toggleItemFormat} /></td>
+                                  <td><FormatCell qid={v.id} item={it} field="mrp" type="number" value={it.mrp ?? ""} onChange={(v2) => updateItemField(v.id, it.key, "mrp", v2 === "" ? null : Number(v2))} onToggleFormat={toggleItemFormat} /></td>
+                                  <td><FormatCell qid={v.id} item={it} field="unitPrice" type="number" value={it.unitPrice} onChange={(v2) => updateItemField(v.id, it.key, "unitPrice", Number(v2))} onToggleFormat={toggleItemFormat} /></td>
+                                  <td><FormatCell qid={v.id} item={it} field="discountPercent" type="number" value={it.discountPercent ?? ""} onChange={(v2) => updateItemField(v.id, it.key, "discountPercent", v2 === "" ? null : Number(v2))} onToggleFormat={toggleItemFormat} /></td>
+                                  <td>
                                     <div className="flex items-start">
                                       <div className="flex-1 min-w-0">
-                                        <FormatCell qid={v.id} item={it} field="totalPrice" type="number" value={it.totalPrice} onChange={(v2) => updateItemField(v.id, it.key, "totalPrice", Number(v2))} inputClassName="font-medium" />
+                                        <FormatCell qid={v.id} item={it} field="totalPrice" type="number" value={it.totalPrice} onChange={(v2) => updateItemField(v.id, it.key, "totalPrice", Number(v2))} onToggleFormat={toggleItemFormat} inputClassName="font-medium" />
                                       </div>
                                       <button onClick={() => removeItem(v.id, it.key)} className="opacity-0 group-hover/item:opacity-100 text-muted-foreground hover:text-destructive shrink-0 pr-1 mt-0.5" title="Delete item">
                                         <Trash2 className="w-3 h-3" />
                                       </button>
                                     </div>
                                   </td>
-                                  <CustomFieldCells qid={v.id} item={it} />
+                                  <CustomFieldCells qid={v.id} item={it} customColumns={customColumns} onChange={updateItemCustomField} onToggleFormat={toggleItemFormat} />
                                 </tr>
                               ))}
                               <tr>
@@ -771,31 +960,32 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
                   const items = dv.items.filter((it) => it.matchedCategory === null || !comparison.rows.some((r) => r.category === it.matchedCategory))
 
                   return (
-                    <td key={v.id} colSpan={colsPerVendor} className={`border-l p-0 ${vHidden ? "opacity-30" : ""}`}>
-                      <table className="w-full">
+                    <td key={v.id} colSpan={colsPerVendor} className={`border-l p-0 align-top ${vHidden ? "opacity-30" : ""}`}>
+                      <table style={{ width: vendorBlockWidth, tableLayout: "fixed" }}>
+                        <VendorColGroup />
                         <tbody>
                           {items.map((it) => (
                             <tr key={it.key} className="border-b border-border/40 last:border-b-0 group/item">
-                              <td className="w-[28%]">
-                                <FormatCell qid={v.id} item={it} field="vendorItemName" value={it.vendorItemName} onChange={(v2) => updateItemField(v.id, it.key, "vendorItemName", v2)} placeholder="Item name" />
-                                <FormatCell qid={v.id} item={it} field="spec" value={it.spec ?? ""} onChange={(v2) => updateItemField(v.id, it.key, "spec", v2 || null)} placeholder="Spec" inputClassName="text-muted-foreground" />
-                                <CategorySelect qid={v.id} item={it} />
+                              <td>
+                                <FormatCell qid={v.id} item={it} field="vendorItemName" value={it.vendorItemName} onChange={(v2) => updateItemField(v.id, it.key, "vendorItemName", v2)} onToggleFormat={toggleItemFormat} placeholder="Item name" />
+                                <FormatCell qid={v.id} item={it} field="spec" value={it.spec ?? ""} onChange={(v2) => updateItemField(v.id, it.key, "spec", v2 || null)} onToggleFormat={toggleItemFormat} placeholder="Spec" inputClassName="text-muted-foreground" />
+                                <CategorySelect qid={v.id} item={it} categoryOptions={categoryOptions} onChange={setItemCategory} />
                               </td>
-                              <td className="w-[9%]"><FormatCell qid={v.id} item={it} field="quantity" type="number" value={it.quantity} onChange={(v2) => updateItemField(v.id, it.key, "quantity", Number(v2))} /></td>
-                              <td className="w-[10%]"><FormatCell qid={v.id} item={it} field="mrp" type="number" value={it.mrp ?? ""} onChange={(v2) => updateItemField(v.id, it.key, "mrp", v2 === "" ? null : Number(v2))} /></td>
-                              <td className="w-[10%]"><FormatCell qid={v.id} item={it} field="unitPrice" type="number" value={it.unitPrice} onChange={(v2) => updateItemField(v.id, it.key, "unitPrice", Number(v2))} /></td>
-                              <td className="w-[8%]"><FormatCell qid={v.id} item={it} field="discountPercent" type="number" value={it.discountPercent ?? ""} onChange={(v2) => updateItemField(v.id, it.key, "discountPercent", v2 === "" ? null : Number(v2))} /></td>
-                              <td className="w-[13%]">
+                              <td><FormatCell qid={v.id} item={it} field="quantity" type="number" value={it.quantity} onChange={(v2) => updateItemField(v.id, it.key, "quantity", Number(v2))} onToggleFormat={toggleItemFormat} /></td>
+                              <td><FormatCell qid={v.id} item={it} field="mrp" type="number" value={it.mrp ?? ""} onChange={(v2) => updateItemField(v.id, it.key, "mrp", v2 === "" ? null : Number(v2))} onToggleFormat={toggleItemFormat} /></td>
+                              <td><FormatCell qid={v.id} item={it} field="unitPrice" type="number" value={it.unitPrice} onChange={(v2) => updateItemField(v.id, it.key, "unitPrice", Number(v2))} onToggleFormat={toggleItemFormat} /></td>
+                              <td><FormatCell qid={v.id} item={it} field="discountPercent" type="number" value={it.discountPercent ?? ""} onChange={(v2) => updateItemField(v.id, it.key, "discountPercent", v2 === "" ? null : Number(v2))} onToggleFormat={toggleItemFormat} /></td>
+                              <td>
                                 <div className="flex items-start">
                                   <div className="flex-1 min-w-0">
-                                    <FormatCell qid={v.id} item={it} field="totalPrice" type="number" value={it.totalPrice} onChange={(v2) => updateItemField(v.id, it.key, "totalPrice", Number(v2))} inputClassName="font-medium" />
+                                    <FormatCell qid={v.id} item={it} field="totalPrice" type="number" value={it.totalPrice} onChange={(v2) => updateItemField(v.id, it.key, "totalPrice", Number(v2))} onToggleFormat={toggleItemFormat} inputClassName="font-medium" />
                                   </div>
                                   <button onClick={() => removeItem(v.id, it.key)} className="opacity-0 group-hover/item:opacity-100 text-muted-foreground hover:text-destructive shrink-0 pr-1 mt-0.5" title="Delete item">
                                     <Trash2 className="w-3 h-3" />
                                   </button>
                                 </div>
                               </td>
-                              <CustomFieldCells qid={v.id} item={it} />
+                              <CustomFieldCells qid={v.id} item={it} customColumns={customColumns} onChange={updateItemCustomField} onToggleFormat={toggleItemFormat} />
                             </tr>
                           ))}
                           <tr>
@@ -818,6 +1008,9 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
                 <tr key={infoKey} className="bg-muted/5 text-xs">
                   <td className="sticky left-0 bg-muted/5 z-10 border-r px-3 py-1.5 font-medium text-muted-foreground italic">
                     {ADDITIONAL_INFO_LABELS[infoKey]}
+                    {(CHARGE_KEYS as readonly string[]).includes(infoKey) && (
+                      <span className="not-italic normal-case text-[9px] text-muted-foreground/60"> (in Grand Total)</span>
+                    )}
                   </td>
                   {doneVendors.map((v) => {
                     const dv = draft[v.id]
@@ -828,7 +1021,7 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
                           className="w-full bg-transparent border-0 border-b border-dashed border-transparent hover:border-muted-foreground/40 focus:border-primary focus:outline-none text-muted-foreground text-xs px-0 py-0.5"
                           value={dv.additionalInfo[infoKey] ?? ""}
                           onChange={(e) => updateAdditionalInfo(v.id, infoKey, e.target.value)}
-                          placeholder="-"
+                          placeholder={(CHARGE_KEYS as readonly string[]).includes(infoKey) ? "e.g. 18% or ₹2000" : "-"}
                         />
                       </td>
                     )
@@ -846,11 +1039,10 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
                   const vHidden = hiddenVendors.has(v.id)
                   return (
                     <td key={v.id} colSpan={colsPerVendor} className={`border-l px-2 py-2.5 ${vHidden ? "opacity-30" : ""}`}>
-                      <input
-                        type="number"
-                        className="w-full bg-transparent border-0 border-b border-dashed border-white/30 focus:border-white focus:outline-none text-right tabular-nums text-sm px-1"
+                      <PlainNumberInput
                         value={dv.grandTotal ?? ""}
-                        onChange={(e) => updateGrandTotal(v.id, e.target.value)}
+                        onChange={(raw) => updateGrandTotal(v.id, raw)}
+                        className="w-full bg-transparent border-0 border-b border-dashed border-white/30 focus:border-white focus:outline-none text-right tabular-nums text-sm px-1"
                       />
                     </td>
                   )

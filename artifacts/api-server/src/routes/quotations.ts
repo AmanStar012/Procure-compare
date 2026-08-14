@@ -42,10 +42,22 @@ async function extractText(buffer: Buffer, mimetype: string, originalname: strin
     return { text: lines.join("\n"), kind: "text" };
   }
 
-  // DOCX (basic — treat as binary text extraction via xlsx)
+  // DOCX — a zip of XML, not plain text, so it needs real extraction (raw
+  // buffer.toString("utf8") on the compressed bytes just produces garbage).
+  // Use HTML rather than plain text: some vendor quote tables cram several
+  // line items into one table cell as stacked paragraphs instead of separate
+  // rows, and flat text extraction loses which paragraph in one column lines
+  // up with which paragraph in another — HTML keeps the <table>/<tr>/<td>
+  // boundaries so the model can still work out the pairing. Images are
+  // stripped (not needed for extraction, and embedding them as base64 can
+  // balloon the HTML from a few KB to multiple MB).
   if (ext === "docx" || mimetype.includes("wordprocessingml")) {
-    // Fallback: send raw text-decoded content
-    return { text: buffer.toString("utf8").replace(/[^\x20-\x7E\n\r\t]/g, " "), kind: "text" };
+    const mammoth = await import("mammoth");
+    const { value } = await mammoth.convertToHtml(
+      { buffer },
+      { convertImage: mammoth.images.imgElement(() => Promise.resolve({ src: "" })) },
+    );
+    return { text: value, kind: "text" };
   }
 
   // Fallback: plain text
@@ -119,6 +131,37 @@ router.post("/projects/:id/quotations/upload", upload.single("file"), async (req
       .where(and(eq(quotationsTable.projectId, projectId), eq(quotationsTable.status, "done")));
 
     const shouldBenchmark = existingDone.length === 0;
+
+    // The benchmark vendor is the reference document — every item it lists should
+    // become a proper comparison row, not silently fall into "Other Items" just
+    // because the user didn't think to pre-type that category when creating the
+    // project. Promote its own unmatched items into new target categories (only
+    // for the benchmark; later vendors' unmatched items still land in "Other").
+    if (shouldBenchmark) {
+      const existingLower = new Map(targetItems.map((t) => [t.toLowerCase(), t]));
+      const newCategories: string[] = [];
+      for (const item of parsed.items) {
+        if (item.matchedCategory !== null) continue;
+        const label = item.vendorItemName.trim();
+        if (!label) continue;
+        const existing = existingLower.get(label.toLowerCase());
+        if (existing) {
+          // Someone already added this category under slightly different casing —
+          // reuse the existing spelling instead of creating a near-duplicate.
+          item.matchedCategory = existing;
+          continue;
+        }
+        existingLower.set(label.toLowerCase(), label);
+        newCategories.push(label);
+        item.matchedCategory = label;
+      }
+      if (newCategories.length > 0) {
+        await db
+          .update(projectsTable)
+          .set({ targetItems: JSON.stringify([...targetItems, ...newCategories]) })
+          .where(eq(projectsTable.id, projectId));
+      }
+    }
 
     const [updated] = await db
       .update(quotationsTable)
