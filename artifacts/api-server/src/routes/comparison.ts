@@ -4,6 +4,7 @@ import { quotationsTable, projectsTable } from "@workspace/db";
 import { eq } from "drizzle-orm";
 import { buildComparison, type VendorLineItem, type OtherItem } from "../lib/build-comparison.js";
 import type { ParsedQuotation, ItemFormat, ItemFormatMap } from "../lib/parse-quotation.js";
+import { computeCharges, CHARGE_LABELS, type ChargeBreakdown } from "../lib/charges.js";
 import ExcelJS from "exceljs";
 
 const router = Router();
@@ -61,7 +62,12 @@ router.get("/projects/:id/summary", async (req, res) => {
       .map((q) => {
         try {
           const parsed = JSON.parse(q.parsedData!) as ParsedQuotation;
-          return { vendorName: q.vendorName, total: parsed.grandTotal };
+          // Rank vendors on our own calculation (items + charges + GST), not the total
+          // printed on their document, which may contain arithmetic mistakes.
+          const total = parsed.items.length > 0
+            ? computeCharges(parsed.items, parsed.additionalInfo).grandTotal
+            : parsed.grandTotal;
+          return { vendorName: q.vendorName, total };
         } catch {
           return { vendorName: q.vendorName, total: null };
         }
@@ -442,10 +448,13 @@ router.get("/projects/:id/export", async (req, res) => {
       }
     }
 
-    // ── Additional info rows ─────────────────────────────────────────
+    // ── Terms rows (lead time, samples, payment, warranty) ───────────
+    // The monetary ones (designing, freight, installation, GST) are not listed here as
+    // free text — they're calculated and shown as rows in the totals block below.
     ws.addRow([]).height = 8;
 
-    for (const info of result.additionalInfo) {
+    const CHARGE_LABEL_SET = new Set<string>(Object.values(CHARGE_LABELS));
+    for (const info of result.additionalInfo.filter((i) => !CHARGE_LABEL_SET.has(i.label))) {
       const infoRow = ws.addRow([]);
       infoRow.height = 16;
 
@@ -467,29 +476,139 @@ router.get("/projects/:id/export", async (req, res) => {
       });
     }
 
-    // ── Grand total row ──────────────────────────────────────────────
+    // ── Charges & totals ─────────────────────────────────────────────
+    // Calculated by us from each vendor's line items and quoted charge text rather than
+    // copied from the vendor's own grand total, since vendors make arithmetic mistakes.
+    const MONEY_FMT = '₹#,##0.00';
+    const AMBER_FILL = "FFFFE699";
+    const stated = new Map<number, ParsedQuotation>();
+    const breakdowns = new Map<number, ChargeBreakdown>();
+    for (const v of doneVendors) {
+      if (!v.parsedData) continue;
+      const parsed = JSON.parse(v.parsedData) as ParsedQuotation;
+      stated.set(v.id, parsed);
+      breakdowns.set(v.id, computeCharges(parsed.items, parsed.additionalInfo));
+    }
+    const rupees = (n: number) => "₹" + new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2 }).format(n);
+
     ws.addRow([]).height = 8;
+
+    // One row: label in col A, descriptive text across Spec..Disc, amount under the Total column.
+    const addAmountRow = (
+      label: string,
+      cellsFor: (b: ChargeBreakdown) => { text: string; amount: number | null },
+      style: { bold?: boolean; fill?: string; fontColor?: string; height?: number } = {},
+    ) => {
+      const row = ws.addRow([]);
+      row.height = style.height ?? 16;
+      const lc = row.getCell(CAT_COL);
+      lc.value = label;
+      lc.font = { bold: true, italic: !style.bold, color: style.fontColor ? { argb: style.fontColor } : undefined };
+      if (style.fill) lc.fill = { type: "pattern", pattern: "solid", fgColor: { argb: style.fill } };
+      lc.border = allBorders;
+
+      let longestText = 0;
+      doneVendors.forEach((v, vi) => {
+        const b = breakdowns.get(v.id);
+        const sc = vendorStartCol(vi);
+        for (let off = 0; off < NUM_DATA_COLS; off++) {
+          const c = row.getCell(sc + off);
+          c.border = allBorders;
+          if (style.fill) c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: style.fill } };
+        }
+        if (!b) return;
+        const { text, amount } = cellsFor(b);
+        longestText = Math.max(longestText, text.length);
+        const tc = row.getCell(sc);
+        tc.value = text;
+        tc.font = { size: 9, italic: true, color: { argb: style.fontColor ?? "FF666666" } };
+        tc.alignment = { horizontal: "left", vertical: "middle", wrapText: true };
+        ws.mergeCells(row.number, sc, row.number, sc + 4);
+
+        const ac = row.getCell(totalCol(vi));
+        ac.value = amount ?? "-";
+        ac.numFmt = MONEY_FMT;
+        ac.font = { bold: !!style.bold, color: style.fontColor ? { argb: style.fontColor } : undefined };
+        ac.alignment = { horizontal: "right", vertical: "middle" };
+      });
+      // The text cell spans roughly 55 characters at this font size — grow the row to fit.
+      row.height = Math.max(row.height ?? 16, Math.ceil(longestText / 55) * 12 + 4);
+      return row;
+    };
+
+    addAmountRow("Items Subtotal", (b) => ({ text: "", amount: b.itemsSubtotal }), { bold: true });
+
+    for (const key of ["designingCharges", "freight", "installation"] as const) {
+      addAmountRow(CHARGE_LABELS[key], (b) => {
+        const line = b.lines.find((l) => l.key === key)!;
+        if (line.itemisedAmount > 0) return { text: `Already listed as an item above (${rupees(line.itemisedAmount)})`, amount: null };
+        if (line.waived) return { text: `${line.basis} — no charge`, amount: 0 };
+        if (!line.basis) return { text: "Not stated", amount: null };
+        return { text: line.basis, amount: line.amount };
+      });
+    }
+
+    addAmountRow("Total before GST", (b) => ({ text: "", amount: b.taxableValue }), { bold: true, fill: GRAY_FILL });
+
+    addAmountRow("GST", (b) => {
+      if (b.gst.included) return { text: `${b.gst.basis} — already included in the prices above, nothing added`, amount: 0 };
+      if (b.gst.rate != null) return { text: `${b.gst.rate}% of ${rupees(b.taxableValue)} (calculated)`, amount: b.gst.amount };
+      if (b.gst.basis) return { text: `${b.gst.basis} — amount as stated by vendor, rate unknown`, amount: b.gst.amount };
+      return { text: "GST not stated — NOT included in the total below", amount: null };
+    }, { bold: true });
+
+    ws.addRow([]).height = 6;
+
+    // Grand total
     const gtRow = ws.addRow([]);
     gtRow.height = 22;
 
     const gtLabel = gtRow.getCell(CAT_COL);
-    gtLabel.value = "GRAND TOTAL";
+    gtLabel.value = "GRAND TOTAL (incl. GST)";
     gtLabel.font  = { bold: true, size: 11, color: { argb: WHITE } };
     gtLabel.fill  = { type: "pattern", pattern: "solid", fgColor: { argb: DARK_BLUE } };
-    gtLabel.alignment = { horizontal: "center", vertical: "middle" };
+    gtLabel.alignment = { horizontal: "center", vertical: "middle", wrapText: true };
     gtLabel.border = allBorders;
 
     doneVendors.forEach((_v, vi) => {
-      const gt = result.grandTotals.find((g) => g.quotationId === _v.id);
       const sc = vendorStartCol(vi);
       const cell = gtRow.getCell(sc);
-      cell.value = gt?.total ?? "";
-      cell.numFmt = '₹#,##0';
+      cell.value = breakdowns.get(_v.id)?.grandTotal ?? "";
+      cell.numFmt = MONEY_FMT;
       cell.font  = { bold: true, size: 11, color: { argb: WHITE } };
       cell.fill  = { type: "pattern", pattern: "solid", fgColor: { argb: DARK_BLUE } };
       cell.alignment = { horizontal: "right", vertical: "middle" };
       cell.border = allBorders;
       ws.mergeCells(gtRow.number, sc, gtRow.number, sc + NUM_DATA_COLS - 1);
+    });
+
+    // Cross-check against the total the vendor printed on their own document
+    const checkRow = ws.addRow([]);
+    checkRow.height = 28;
+    const checkLabel = checkRow.getCell(CAT_COL);
+    checkLabel.value = "Check vs vendor's quote";
+    checkLabel.font = { italic: true, bold: true };
+    checkLabel.border = allBorders;
+
+    doneVendors.forEach((_v, vi) => {
+      const sc = vendorStartCol(vi);
+      const calc = breakdowns.get(_v.id)?.grandTotal;
+      const vendorTotal = stated.get(_v.id)?.grandTotal ?? null;
+      const cell = checkRow.getCell(sc);
+      cell.alignment = { horizontal: "left", vertical: "middle", wrapText: true };
+      cell.border = allBorders;
+      cell.font = { size: 9 };
+      if (calc == null || vendorTotal == null) {
+        cell.value = "Vendor's own total not available to compare";
+      } else if (Math.abs(calc - vendorTotal) < 1) {
+        cell.value = `✓ Matches the vendor's quoted total (${rupees(vendorTotal)})`;
+        cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: GREEN_FILL } };
+      } else {
+        const diff = calc - vendorTotal;
+        cell.value = `⚠ Vendor quoted ${rupees(vendorTotal)} — our calculation is ${rupees(Math.abs(diff))} ${diff < 0 ? "lower" : "higher"}`;
+        cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: AMBER_FILL } };
+      }
+      ws.mergeCells(checkRow.number, sc, checkRow.number, sc + NUM_DATA_COLS - 1);
     });
 
     // ── Column widths ────────────────────────────────────────────────

@@ -108,10 +108,10 @@ function buildExtractionTool(targetItems: string[]): Anthropic.Tool {
         additionalInfo: {
           type: "object",
           properties: {
-            designingCharges: { type: ["string", "null"] },
-            gst: { type: ["string", "null"], description: "GST percentage or amount" },
-            installation: { type: ["string", "null"], description: "Installation notes, if not already captured as a priced line item" },
-            freight: { type: ["string", "null"], description: "Cartage or freight charges" },
+            designingCharges: { type: ["string", "null"], description: "Designing charges as quoted (e.g. '₹5,000' or '2%'), or null if absent or already captured as a priced line item" },
+            gst: { type: ["string", "null"], description: "The GST rate or wording exactly as quoted (e.g. 'IGST @ 18%', 'Inclusive of GST'). Do not put the vendor's computed GST amount here when a percentage is given." },
+            installation: { type: ["string", "null"], description: "Installation charges as quoted (e.g. '₹10,000' or '3%'), or null if absent or already captured as a priced line item" },
+            freight: { type: ["string", "null"], description: "Freight/cartage charges as quoted (e.g. '₹12,000' or 'Extra at actuals'), or null if absent or already captured as a priced line item" },
             leadTime: { type: ["string", "null"] },
             samplesForReview: { type: ["string", "null"], description: "YES/NO or description" },
             paymentSchedule: { type: ["string", "null"] },

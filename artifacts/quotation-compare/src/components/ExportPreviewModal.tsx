@@ -16,7 +16,8 @@ import {
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { useToast } from "@/hooks/use-toast"
-import { Download, X, Eye, RotateCcw, Plus, Trash2, Loader2, Save, Bold, Italic, Underline, Highlighter, Columns3 } from "lucide-react"
+import { Download, X, Eye, RotateCcw, Plus, Trash2, Loader2, Save, Bold, Italic, Underline, Highlighter, Columns3, GripVertical } from "lucide-react"
+import { computeCharges, CHARGE_KEYS, CHARGE_LABELS, type ChargeBreakdown, type ChargeKey } from "@/lib/charges"
 
 // ── Draft (editable) data model ────────────────────────────────────────────
 const ADDITIONAL_INFO_LABELS: Record<string, string> = {
@@ -34,9 +35,10 @@ const LABEL_TO_KEY: Record<string, string> = Object.fromEntries(
 )
 const ADDITIONAL_INFO_KEYS = Object.keys(ADDITIONAL_INFO_LABELS)
 
-// Additional-info fields that represent a monetary charge (flat ₹ amount or a
-// "%" applied to the items subtotal) and therefore feed into the Grand Total.
-const CHARGE_KEYS = ["gst", "freight", "installation"] as const
+// Designing/freight/installation/GST are monetary: they're calculated and shown as rows in
+// the totals block (see computeCharges). Only the remaining terms stay as plain text rows.
+const CHARGE_LABEL_SET = new Set<string>(Object.values(CHARGE_LABELS))
+const TERMS_INFO_KEYS = ADDITIONAL_INFO_KEYS.filter((k) => !CHARGE_LABEL_SET.has(ADDITIONAL_INFO_LABELS[k]))
 
 const DEFAULT_COL_LABELS: Record<keyof ColumnLabels, string> = {
   spec: "Item / Spec",
@@ -175,7 +177,7 @@ interface Props {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 const fmt = (n: number | null | undefined) => {
   if (n == null) return "-"
-  return "₹ " + new Intl.NumberFormat("en-IN").format(n)
+  return "₹ " + new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2 }).format(n)
 }
 
 // Comma-grouped display for a numeric cell, e.g. 31463.41 -> "31,463.41".
@@ -184,24 +186,6 @@ const formatNumberForDisplay = (value: string | number | null | undefined) => {
   const num = typeof value === "number" ? value : Number(value)
   if (Number.isNaN(num)) return String(value)
   return new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2 }).format(num)
-}
-
-// Best-effort read of a free-text additional-info field (e.g. "18%", "₹2,000",
-// "Included") as a monetary contribution — a "%" is applied against the items
-// subtotal, a plain number is taken as a flat amount, anything else is 0.
-const parseChargeAmount = (raw: string | null | undefined, base: number): number => {
-  if (!raw) return 0
-  const percentMatch = raw.match(/(-?\d[\d,]*\.?\d*)\s*%/)
-  if (percentMatch) return (base * parseFloat(percentMatch[1].replace(/,/g, ""))) / 100
-  const flatMatch = raw.match(/(-?\d[\d,]*\.?\d*)/)
-  if (flatMatch) return parseFloat(flatMatch[1].replace(/,/g, ""))
-  return 0
-}
-
-const computeGrandTotal = (v: DraftVendor): number => {
-  const itemsSubtotal = v.items.reduce((sum, it) => sum + (it.totalPrice || 0), 0)
-  const extra = CHARGE_KEYS.reduce((sum, k) => sum + parseChargeAmount(v.additionalInfo[k], itemsSubtotal), 0)
-  return Math.round((itemsSubtotal + extra) * 100) / 100
 }
 
 const formatClasses = (f: ItemFormatState | undefined) =>
@@ -298,38 +282,6 @@ function FormatCell({
   )
 }
 
-// Standalone comma-formatted number input (no per-cell B/I/U toolbar) — used
-// for the Grand Total row. Shares FormatCell's focus/draft-text behavior.
-function PlainNumberInput({
-  value, onChange, className,
-}: {
-  value: string | number
-  onChange: (raw: string) => void
-  className?: string
-}) {
-  const [focused, setFocused] = useState(false)
-  const [draftText, setDraftText] = useState("")
-  const displayValue = focused ? draftText : formatNumberForDisplay(value)
-  return (
-    <input
-      type="text"
-      inputMode="decimal"
-      value={displayValue}
-      onFocus={() => {
-        setFocused(true)
-        setDraftText(value === "" || value == null ? "" : String(value))
-      }}
-      onBlur={() => setFocused(false)}
-      onChange={(e) => {
-        const cleaned = e.target.value.replace(/[^0-9.-]/g, "")
-        setDraftText(cleaned)
-        onChange(cleaned)
-      }}
-      className={className}
-    />
-  )
-}
-
 function CategorySelect({
   qid, item, categoryOptions, onChange,
 }: {
@@ -397,8 +349,15 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
   const [dirty, setDirty] = useState<Set<number>>(new Set())
   const [saving, setSaving] = useState(false)
 
-  // Category labels (index-aligned with comparison.rows) — editable, project-wide rename on save
-  const [categories, setCategories] = useState<string[]>(() => comparison.rows.map((r) => r.category))
+  // Comparison rows in display order. `orig` is the category name the server currently has
+  // (items are matched on it); `label` is the editable name (renamed project-wide on save).
+  // The order can be changed by dragging and is saved as the project's category order, so it
+  // carries through to the Excel export.
+  const [rowList, setRowList] = useState<{ orig: string; label: string }[]>(() =>
+    comparison.rows.map((r) => ({ orig: r.category, label: r.category })),
+  )
+  const [dragOrig, setDragOrig] = useState<string | null>(null)
+  const [dragOverOrig, setDragOverOrig] = useState<string | null>(null)
   // Shared column config, lives on the project
   const [customColumns, setCustomColumns] = useState<CustomColumn[]>(() => project.customColumns)
   const [columnLabels, setColumnLabels] = useState<ColumnLabels>(() => project.columnLabels)
@@ -415,9 +374,19 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
   const tableWidth = CATEGORY_COL_WIDTH + doneVendors.length * vendorBlockWidth
 
   const categoryOptions = useMemo(
-    () => comparison.rows.map((r, i) => ({ value: r.category, label: categories[i] ?? r.category })),
-    [comparison.rows, categories]
+    () => rowList.map((r) => ({ value: r.orig, label: r.label })),
+    [rowList]
   )
+
+  // Our own calculation of every vendor's subtotal, charges, GST and grand total.
+  const breakdowns = useMemo(() => {
+    const m = new Map<number, ChargeBreakdown>()
+    for (const v of doneVendors) {
+      const dv = draft[v.id]
+      if (dv) m.set(v.id, computeCharges(dv.items, dv.additionalInfo))
+    }
+    return m
+  }, [doneVendors, draft])
 
   const [hiddenVendors, setHiddenVendors] = useState<Set<number>>(new Set())
   const [hiddenRows, setHiddenRows] = useState<Set<string>>(new Set())
@@ -443,8 +412,23 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
     setProjectMetaDirty(true)
   }
 
-  const updateCategoryLabel = (idx: number, value: string) => {
-    setCategories((prev) => prev.map((c, i) => (i === idx ? value : c)))
+  const updateCategoryLabel = (orig: string, value: string) => {
+    setRowList((prev) => prev.map((r) => (r.orig === orig ? { ...r, label: value } : r)))
+    setProjectMetaDirty(true)
+  }
+
+  // Drop `from` into the place currently held by `to` (moving up lands before it, moving down after).
+  const moveRow = (from: string, to: string) => {
+    if (from === to) return
+    setRowList((prev) => {
+      const fromIdx = prev.findIndex((r) => r.orig === from)
+      const toIdx = prev.findIndex((r) => r.orig === to)
+      if (fromIdx < 0 || toIdx < 0) return prev
+      const next = [...prev]
+      const [moved] = next.splice(fromIdx, 1)
+      next.splice(toIdx, 0, moved)
+      return next
+    })
     setProjectMetaDirty(true)
   }
 
@@ -486,8 +470,7 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
         }
         return updated
       })
-      const nextVendor = { ...vendor, items }
-      return { ...prev, [qid]: { ...nextVendor, grandTotal: computeGrandTotal(nextVendor) } }
+      return { ...prev, [qid]: { ...vendor, items } }
     })
     markDirty(qid)
   }
@@ -528,45 +511,28 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
         ...vendor.items,
         { key: nextKey(), matchedCategory: category, vendorItemName: "New item", spec: null, quantity: 1, mrp: null, unitPrice: 0, discountPercent: null, totalPrice: 0, format: {}, customFields: {} },
       ]
-      const nextVendor = { ...vendor, items }
-      return { ...prev, [qid]: { ...nextVendor, grandTotal: computeGrandTotal(nextVendor) } }
+      return { ...prev, [qid]: { ...vendor, items } }
     })
     markDirty(qid)
   }
 
   const removeItem = (qid: number, key: string) => {
-    setDraft((prev) => {
-      const vendor = prev[qid]
-      const items = vendor.items.filter((it) => it.key !== key)
-      const nextVendor = { ...vendor, items }
-      return { ...prev, [qid]: { ...nextVendor, grandTotal: computeGrandTotal(nextVendor) } }
-    })
+    setDraft((prev) => ({ ...prev, [qid]: { ...prev[qid], items: prev[qid].items.filter((it) => it.key !== key) } }))
     markDirty(qid)
   }
 
   const updateAdditionalInfo = (qid: number, field: string, value: string) => {
-    setDraft((prev) => {
-      const vendor = prev[qid]
-      const nextVendor = { ...vendor, additionalInfo: { ...vendor.additionalInfo, [field]: value === "" ? null : value } }
-      // GST/Freight/Installation feed the Grand Total (flat ₹ or a "%" of items subtotal).
-      const grandTotal = (CHARGE_KEYS as readonly string[]).includes(field) ? computeGrandTotal(nextVendor) : nextVendor.grandTotal
-      return { ...prev, [qid]: { ...nextVendor, grandTotal } }
-    })
-    markDirty(qid)
-  }
-
-  const updateGrandTotal = (qid: number, value: string) => {
-    const num = value === "" ? null : Number(value)
-    setDraft((prev) => ({ ...prev, [qid]: { ...prev[qid], grandTotal: num !== null && isNaN(num) ? prev[qid].grandTotal : num } }))
+    setDraft((prev) => ({ ...prev, [qid]: { ...prev[qid], additionalInfo: { ...prev[qid].additionalInfo, [field]: value === "" ? null : value } } }))
     markDirty(qid)
   }
 
   const handleSave = useCallback(async (): Promise<boolean> => {
-    // Figure out category renames (index-aligned with comparison.rows) and validate.
+    // Figure out category renames and validate. finalCategories is in display order, which
+    // is what gets saved as the project's category order.
     const renameMap: Record<string, string> = {}
-    const finalCategories = categories.map((c) => c.trim())
-    for (let i = 0; i < comparison.rows.length; i++) {
-      const original = comparison.rows[i].category
+    const finalCategories = rowList.map((r) => r.label.trim())
+    for (let i = 0; i < rowList.length; i++) {
+      const original = rowList[i].orig
       const next = finalCategories[i]
       if (!next) {
         toast({ title: "Category name can't be empty", variant: "destructive" })
@@ -652,6 +618,9 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
           return next
         })
       }
+      // The server now knows the rows under their saved names, in their saved order.
+      setRowList((prev) => prev.map((r) => ({ orig: r.label.trim(), label: r.label.trim() })))
+      setHiddenRows((prev) => new Set([...prev].map((k) => renameMap[k] ?? k)))
       queryClient.invalidateQueries({ queryKey: getGetComparisonQueryKey(projectId) })
       queryClient.invalidateQueries({ queryKey: getListQuotationsQueryKey(projectId) })
       queryClient.invalidateQueries({ queryKey: getGetProjectSummaryQueryKey(projectId) })
@@ -666,7 +635,7 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
     } finally {
       setSaving(false)
     }
-  }, [dirty, draft, projectId, queryClient, toast, updateQuotation, updateProject, categories, comparison.rows, customColumns, columnLabels, projectMetaDirty, doneVendors])
+  }, [dirty, draft, projectId, queryClient, toast, updateQuotation, updateProject, rowList, customColumns, columnLabels, projectMetaDirty, doneVendors])
 
   const visibleOtherItems = comparison.otherItems.filter((item) => !hiddenVendors.has(item.quotationId))
 
@@ -677,7 +646,12 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
     }
     const params = new URLSearchParams()
     if (hiddenVendors.size) params.set("excludeVendors", [...hiddenVendors].join(","))
-    if (hiddenRows.size) params.set("excludeRows", [...hiddenRows].join(";;"))
+    // Hidden rows are tracked by the name the server had when the modal opened; by now (after
+    // the save above) the server knows them under their edited label.
+    if (hiddenRows.size) {
+      const serverName = (orig: string) => rowList.find((r) => r.orig === orig)?.label.trim() ?? orig
+      params.set("excludeRows", [...hiddenRows].map(serverName).join(";;"))
+    }
     const qs = params.toString() ? `?${params.toString()}` : ""
     window.location.href = `${basePath}api/projects/${projectId}/export${qs}`
   }
@@ -697,7 +671,8 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
 
   if (!open) return null
 
-  const ColGroup = () => (
+  // Plain elements rather than inner components, so React doesn't remount them every render.
+  const outerColGroup = (
     <colgroup>
       <col style={{ width: CATEGORY_COL_WIDTH }} />
       {doneVendors.map((v) => (
@@ -709,11 +684,46 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
     </colgroup>
   )
 
-  const VendorColGroup = () => (
+  const vendorColGroup = (
     <colgroup>
       {BUILTIN_COL_KEYS.map((k) => <col key={k} style={{ width: COL_WIDTH[k] }} />)}
       {customColumns.map((col) => <col key={col.id} style={{ width: CUSTOM_COL_WIDTH }} />)}
     </colgroup>
+  )
+
+  // A per-vendor row of the totals block: an editable/explanatory note across Spec..Disc and
+  // the calculated amount under the Total column (custom columns, which sit after Total, stay blank).
+  const renderVendorAmountCells = (
+    cellFor: (v: (typeof doneVendors)[number], dv: DraftVendor, b: ChargeBreakdown) => { note: React.ReactNode; amount: React.ReactNode; amountClass?: string },
+  ) =>
+    doneVendors.map((v) => {
+      const dv = draft[v.id]
+      const b = breakdowns.get(v.id)
+      const vHidden = hiddenVendors.has(v.id)
+      const cell = dv && b ? cellFor(v, dv, b) : null
+      return (
+        <td key={v.id} colSpan={colsPerVendor} className={`border-l p-0 align-top ${vHidden ? "opacity-30" : ""}`}>
+          <table style={{ width: vendorBlockWidth, tableLayout: "fixed" }}>
+            {vendorColGroup}
+            <tbody>
+              <tr>
+                <td colSpan={5} className="px-2 py-1 align-top">{cell?.note}</td>
+                <td className={`px-1 py-1 text-right tabular-nums text-xs pr-2 align-top ${cell?.amountClass ?? ""}`}>{cell?.amount}</td>
+                {customColumns.length > 0 && <td colSpan={customColumns.length} />}
+              </tr>
+            </tbody>
+          </table>
+        </td>
+      )
+    })
+
+  const chargeNoteInput = (qid: number, key: ChargeKey | "gst", dv: DraftVendor, placeholder: string) => (
+    <input
+      className="w-full bg-transparent border-0 border-b border-dashed border-transparent hover:border-muted-foreground/40 focus:border-primary focus:outline-none text-xs px-0 py-0.5"
+      value={dv.additionalInfo[key] ?? ""}
+      onChange={(e) => updateAdditionalInfo(qid, key, e.target.value)}
+      placeholder={placeholder}
+    />
   )
 
   return createPortal(
@@ -761,7 +771,7 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
         {/* Scrollable table area */}
         <div className="flex-1 overflow-auto min-h-0">
           <table className="text-sm border-collapse" style={{ width: tableWidth, tableLayout: "fixed" }}>
-            <ColGroup />
+            {outerColGroup}
             <thead className="sticky top-0 z-20">
               {/* Vendor header row — editable name/address/contact */}
               <tr>
@@ -866,15 +876,47 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
             </thead>
 
             <tbody>
-              {comparison.rows.map((row, rIdx) => {
-                const key = row.category
+              {rowList.map((row) => {
+                const key = row.orig
                 const hidden = hiddenRows.has(key)
+                const isDropTarget = dragOrig !== null && dragOrig !== key && dragOverOrig === key
 
                 return (
-                  <tr key={key} className={`border-b align-top transition-all ${hidden ? "opacity-40 bg-muted/20" : ""}`}>
-                    {/* Category cell — editable label (project-wide rename on save) */}
+                  <tr
+                    key={key}
+                    className={`border-b align-top transition-all ${hidden ? "opacity-40 bg-muted/20" : ""} ${dragOrig === key ? "opacity-40" : ""} ${isDropTarget ? "outline outline-2 outline-primary -outline-offset-2" : ""}`}
+                    onDragOver={(e) => {
+                      if (dragOrig === null) return
+                      e.preventDefault()
+                      e.dataTransfer.dropEffect = "move"
+                      if (dragOverOrig !== key) setDragOverOrig(key)
+                    }}
+                    onDrop={(e) => {
+                      e.preventDefault()
+                      if (dragOrig !== null) moveRow(dragOrig, key)
+                      setDragOrig(null)
+                      setDragOverOrig(null)
+                    }}
+                  >
+                    {/* Category cell — drag handle, editable label (project-wide rename on save) */}
                     <td className="sticky left-0 bg-background z-10 border-r px-3 py-2 font-medium">
                       <div className="flex items-center gap-2">
+                        <span
+                          draggable
+                          onDragStart={(e) => {
+                            setDragOrig(key)
+                            e.dataTransfer.effectAllowed = "move"
+                            e.dataTransfer.setData("text/plain", key)
+                            // Show just this row's label cell as the drag image, not the whole wide row.
+                            const labelCell = (e.currentTarget as HTMLElement).closest("td")
+                            if (labelCell) e.dataTransfer.setDragImage(labelCell, 16, 16)
+                          }}
+                          onDragEnd={() => { setDragOrig(null); setDragOverOrig(null) }}
+                          title="Drag to move this row up or down"
+                          className="shrink-0 -ml-1 cursor-grab active:cursor-grabbing text-muted-foreground/50 hover:text-foreground"
+                        >
+                          <GripVertical className="w-3.5 h-3.5" />
+                        </span>
                         <button
                           onClick={() => toggleRow(key)}
                           title={hidden ? "Restore row" : "Remove row from export"}
@@ -887,8 +929,8 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
                           {hidden ? <Eye className="w-3 h-3" /> : <X className="w-3 h-3" />}
                         </button>
                         <input
-                          value={categories[rIdx] ?? row.category}
-                          onChange={(e) => updateCategoryLabel(rIdx, e.target.value)}
+                          value={row.label}
+                          onChange={(e) => updateCategoryLabel(key, e.target.value)}
                           className={`min-w-0 flex-1 bg-transparent border-0 border-b border-dashed border-transparent hover:border-muted-foreground/40 focus:border-primary focus:outline-none text-sm px-0 ${hidden ? "line-through" : ""}`}
                           title="Rename this category (applies project-wide on save)"
                         />
@@ -898,13 +940,13 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
                     {doneVendors.map((v) => {
                       const dv = draft[v.id]
                       const vHidden = hiddenVendors.has(v.id)
-                      const items = dv.items.filter((it) => it.matchedCategory === row.category)
+                      const items = dv.items.filter((it) => it.matchedCategory === row.orig)
                       const subtotal = items.reduce((sum, it) => sum + (it.totalPrice || 0), 0)
 
                       return (
                         <td key={v.id} colSpan={colsPerVendor} className={`border-l p-0 align-top ${vHidden ? "opacity-30" : ""}`}>
                           <table style={{ width: vendorBlockWidth, tableLayout: "fixed" }}>
-                            <VendorColGroup />
+                            {vendorColGroup}
                             <tbody>
                               {items.map((it) => (
                                 <tr key={it.key} className="border-b border-border/40 last:border-b-0 group/item">
@@ -931,14 +973,15 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
                                 </tr>
                               ))}
                               <tr>
-                                <td colSpan={5 + customColumns.length} className="px-1 py-1">
-                                  <button onClick={() => addItem(v.id, row.category)} className="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-primary">
+                                <td colSpan={5} className="px-1 py-1">
+                                  <button onClick={() => addItem(v.id, row.orig)} className="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-primary">
                                     <Plus className="w-3 h-3" /> Add item
                                   </button>
                                 </td>
                                 <td className="px-1 py-1 text-right text-xs font-semibold tabular-nums pr-2">
                                   {items.length > 0 ? fmt(subtotal) : ""}
                                 </td>
+                                {customColumns.length > 0 && <td colSpan={customColumns.length} />}
                               </tr>
                             </tbody>
                           </table>
@@ -957,12 +1000,12 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
                 {doneVendors.map((v) => {
                   const dv = draft[v.id]
                   const vHidden = hiddenVendors.has(v.id)
-                  const items = dv.items.filter((it) => it.matchedCategory === null || !comparison.rows.some((r) => r.category === it.matchedCategory))
+                  const items = dv.items.filter((it) => it.matchedCategory === null || !rowList.some((r) => r.orig === it.matchedCategory))
 
                   return (
                     <td key={v.id} colSpan={colsPerVendor} className={`border-l p-0 align-top ${vHidden ? "opacity-30" : ""}`}>
                       <table style={{ width: vendorBlockWidth, tableLayout: "fixed" }}>
-                        <VendorColGroup />
+                        {vendorColGroup}
                         <tbody>
                           {items.map((it) => (
                             <tr key={it.key} className="border-b border-border/40 last:border-b-0 group/item">
@@ -1002,15 +1045,12 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
                 })}
               </tr>
 
-              {/* Additional info rows */}
+              {/* Terms rows (lead time, payment, warranty…) — plain text */}
               <tr><td colSpan={1 + doneVendors.length * colsPerVendor} className="h-3 p-0"></td></tr>
-              {ADDITIONAL_INFO_KEYS.map((infoKey) => (
+              {TERMS_INFO_KEYS.map((infoKey) => (
                 <tr key={infoKey} className="bg-muted/5 text-xs">
                   <td className="sticky left-0 bg-muted/5 z-10 border-r px-3 py-1.5 font-medium text-muted-foreground italic">
                     {ADDITIONAL_INFO_LABELS[infoKey]}
-                    {(CHARGE_KEYS as readonly string[]).includes(infoKey) && (
-                      <span className="not-italic normal-case text-[9px] text-muted-foreground/60"> (in Grand Total)</span>
-                    )}
                   </td>
                   {doneVendors.map((v) => {
                     const dv = draft[v.id]
@@ -1021,7 +1061,7 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
                           className="w-full bg-transparent border-0 border-b border-dashed border-transparent hover:border-muted-foreground/40 focus:border-primary focus:outline-none text-muted-foreground text-xs px-0 py-0.5"
                           value={dv.additionalInfo[infoKey] ?? ""}
                           onChange={(e) => updateAdditionalInfo(v.id, infoKey, e.target.value)}
-                          placeholder={(CHARGE_KEYS as readonly string[]).includes(infoKey) ? "e.g. 18% or ₹2000" : "-"}
+                          placeholder="-"
                         />
                       </td>
                     )
@@ -1029,21 +1069,81 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
                 </tr>
               ))}
 
-              {/* Grand total row */}
+              {/* Charges & totals — calculated here from the line items and the charges the vendor
+                  quoted, not copied from the vendor's own total (which may contain mistakes). */}
+              <tr><td colSpan={1 + doneVendors.length * colsPerVendor} className="h-3 p-0"></td></tr>
+              <tr className="bg-muted/10 border-t">
+                <td className="sticky left-0 bg-muted/10 z-10 border-r px-3 py-1.5 text-xs font-semibold">Items Subtotal</td>
+                {renderVendorAmountCells((_v, _dv, b) => ({ note: null, amount: fmt(b.itemsSubtotal), amountClass: "font-semibold" }))}
+              </tr>
+              {CHARGE_KEYS.map((key) => (
+                <tr key={key} className="text-xs">
+                  <td className="sticky left-0 bg-background z-10 border-r px-3 py-1.5 font-medium text-muted-foreground">{CHARGE_LABELS[key]}</td>
+                  {renderVendorAmountCells((v, dv, b) => {
+                    const line = b.lines.find((l) => l.key === key)!
+                    const hint =
+                      line.itemisedAmount > 0 ? `Already listed as an item above (${fmt(line.itemisedAmount)}) — not added again`
+                      : line.waived ? "No charge"
+                      : line.basis && /%/.test(line.basis) ? `${fmt(line.amount)} calculated on the items subtotal`
+                      : null
+                    return {
+                      note: (
+                        <>
+                          {chargeNoteInput(v.id, key, dv, "e.g. ₹2,000 or 2%")}
+                          {hint && <div className="text-[10px] text-muted-foreground mt-0.5">{hint}</div>}
+                        </>
+                      ),
+                      amount: line.itemisedAmount > 0 || (!line.basis) ? "-" : fmt(line.amount),
+                    }
+                  })}
+                </tr>
+              ))}
+              <tr className="bg-muted/10 border-t">
+                <td className="sticky left-0 bg-muted/10 z-10 border-r px-3 py-1.5 text-xs font-semibold">Total before GST</td>
+                {renderVendorAmountCells((_v, _dv, b) => ({ note: null, amount: fmt(b.taxableValue), amountClass: "font-semibold" }))}
+              </tr>
+              <tr className="text-xs">
+                <td className="sticky left-0 bg-background z-10 border-r px-3 py-1.5 font-medium text-muted-foreground">GST</td>
+                {renderVendorAmountCells((v, dv, b) => {
+                  const { gst } = b
+                  const hint =
+                    gst.included ? { text: "Already included in the prices above — nothing added", warn: false }
+                    : gst.rate != null ? { text: `${gst.rate}% of ${fmt(b.taxableValue)} (calculated)`, warn: false }
+                    : gst.basis ? { text: "Amount as stated by the vendor — rate unknown, can't be verified", warn: true }
+                    : { text: "GST not stated — NOT included in the total below", warn: true }
+                  return {
+                    note: (
+                      <>
+                        {chargeNoteInput(v.id, "gst", dv, "e.g. 18%")}
+                        <div className={`text-[10px] mt-0.5 ${hint.warn ? "text-amber-600" : "text-muted-foreground"}`}>{hint.text}</div>
+                      </>
+                    ),
+                    amount: gst.basis || gst.amount ? fmt(gst.amount) : "-",
+                  }
+                })}
+              </tr>
+
+              {/* Grand total — always calculated, with a cross-check against the vendor's own figure */}
               <tr className="font-bold bg-[#1F4E79] text-white border-t-2">
                 <td className="sticky left-0 bg-[#1F4E79] z-10 border-r px-3 py-2.5 text-sm">
-                  GRAND TOTAL
+                  GRAND TOTAL <span className="block text-[10px] font-normal opacity-80">(incl. GST)</span>
                 </td>
                 {doneVendors.map((v) => {
                   const dv = draft[v.id]
+                  const b = breakdowns.get(v.id)
                   const vHidden = hiddenVendors.has(v.id)
+                  const quoted = dv?.grandTotal ?? null
+                  const diff = b && quoted != null ? b.grandTotal - quoted : null
                   return (
-                    <td key={v.id} colSpan={colsPerVendor} className={`border-l px-2 py-2.5 ${vHidden ? "opacity-30" : ""}`}>
-                      <PlainNumberInput
-                        value={dv.grandTotal ?? ""}
-                        onChange={(raw) => updateGrandTotal(v.id, raw)}
-                        className="w-full bg-transparent border-0 border-b border-dashed border-white/30 focus:border-white focus:outline-none text-right tabular-nums text-sm px-1"
-                      />
+                    <td key={v.id} colSpan={colsPerVendor} className={`border-l px-3 py-2 ${vHidden ? "opacity-30" : ""}`}>
+                      <div className="text-right tabular-nums text-base">{b ? fmt(b.grandTotal) : "-"}</div>
+                      {diff != null && (
+                        <div className={`text-right text-[10px] font-normal mt-0.5 ${Math.abs(diff) < 1 ? "text-emerald-300" : "text-amber-300"}`}>
+                          {Math.abs(diff) < 1
+                            ? `✓ Matches the vendor's quoted total (${fmt(quoted)})`
+                            : `⚠ Vendor quoted ${fmt(quoted)} — our calculation is ${fmt(Math.abs(diff))} ${diff < 0 ? "lower" : "higher"}`}
+                        </div>
+                      )}
                     </td>
                   )
                 })}

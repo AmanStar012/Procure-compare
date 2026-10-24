@@ -1,4 +1,4 @@
-import React, { useState, useRef, ChangeEvent } from "react"
+import React, { useState, useRef, useMemo, ChangeEvent } from "react"
 import { useParams, useLocation } from "wouter"
 import { useQueryClient } from "@tanstack/react-query"
 import { 
@@ -41,12 +41,16 @@ import {
   ChevronDown
 } from "lucide-react"
 import { ExportPreviewModal } from "@/components/ExportPreviewModal"
+import { computeCharges, CHARGE_KEYS, CHARGE_LABELS, type ChargeBreakdown } from "@/lib/charges"
 
 // Currency formatter
 const formatCurrency = (amount: number | null | undefined) => {
   if (amount === null || amount === undefined) return "-"
-  return '₹ ' + new Intl.NumberFormat('en-IN').format(amount)
+  return '₹ ' + new Intl.NumberFormat('en-IN', { maximumFractionDigits: 2 }).format(amount)
 }
+
+// The monetary rows are calculated (see computeCharges), so they're left out of the plain-text terms rows.
+const CHARGE_LABEL_SET = new Set<string>(Object.values(CHARGE_LABELS))
 
 export function ProjectDetail() {
   const params = useParams()
@@ -85,6 +89,27 @@ export function ProjectDetail() {
   const { data: comparison, isLoading: loadingComparison } = useGetComparison(projectId, {
     query: { queryKey: getGetComparisonQueryKey(projectId), enabled: !!projectId && hasParsedQuotations }
   })
+
+  // Our own calculation of each vendor's subtotal, charges, GST and grand total — vendors make
+  // arithmetic mistakes, so the total printed on their document is only kept as a cross-check.
+  const vendorCharges = useMemo(() => {
+    const m = new Map<number, ChargeBreakdown>()
+    if (!comparison) return m
+    for (const vd of comparison.vendorDetails ?? []) {
+      const id = vd.quotationId
+      const items = [
+        ...comparison.rows.flatMap((r) => r.vendors.find((v) => v.quotationId === id)?.lineItems ?? []),
+        ...comparison.otherItems.filter((o) => o.quotationId === id),
+      ]
+      const info: Partial<Record<"gst" | (typeof CHARGE_KEYS)[number], string | null>> = {}
+      for (const key of [...CHARGE_KEYS, "gst" as const]) {
+        const row = comparison.additionalInfo.find((a) => a.label === CHARGE_LABELS[key])
+        info[key] = row?.vendors.find((iv) => iv.quotationId === id)?.value ?? null
+      }
+      m.set(id, computeCharges(items, info))
+    }
+    return m
+  }, [comparison])
 
   const deleteQuotation = useDeleteQuotation()
   const setBenchmark = useSetBenchmark()
@@ -157,6 +182,25 @@ export function ProjectDetail() {
   }
 
   if (!project) return <div>Project not found</div>
+
+  // One vendor-wide row of the charges block: a note across Spec..Disc and the amount under Total.
+  const renderChargeCells = (
+    rowKey: string,
+    cellFor: (b: ChargeBreakdown) => { note: React.ReactNode; amount: React.ReactNode; amountClass?: string },
+  ) =>
+    (comparison?.vendors ?? []).map((v) => {
+      const b = vendorCharges.get(v.id)
+      if (!b) {
+        return <TableCell key={`${rowKey}-${v.id}`} colSpan={6} className="border-l text-center text-muted-foreground/40">-</TableCell>
+      }
+      const c = cellFor(b)
+      return (
+        <React.Fragment key={`${rowKey}-${v.id}`}>
+          <TableCell colSpan={5} className="border-l text-xs text-muted-foreground px-4 whitespace-normal">{c.note}</TableCell>
+          <TableCell className={`text-right tabular-nums pr-4 ${c.amountClass ?? ""}`}>{c.amount}</TableCell>
+        </React.Fragment>
+      )
+    })
 
   return (
     <div className="space-y-6 pb-20 animate-in fade-in duration-300">
@@ -455,7 +499,7 @@ export function ProjectDetail() {
                     <TableRow className="border-t-2">
                       <TableCell colSpan={1 + comparison.vendors.length * 6} className="h-4 p-0"></TableCell>
                     </TableRow>
-                    {comparison.additionalInfo.map((info, idx) => (
+                    {comparison.additionalInfo.filter((info) => !CHARGE_LABEL_SET.has(info.label)).map((info, idx) => (
                       <TableRow key={`info-${idx}`} className="bg-muted/5 hover:bg-muted/10">
                         <TableCell className="font-medium text-muted-foreground sticky left-0 bg-muted/5 z-10 border-r shadow-[1px_0_0_0_var(--border)]">
                           {info.label}
@@ -472,18 +516,67 @@ export function ProjectDetail() {
                     ))}
                   </>
                 )}
+
+                {/* Charges & totals — calculated from the line items and the charges each vendor quoted */}
+                <TableRow className="border-t-2">
+                  <TableCell colSpan={1 + comparison.vendors.length * 6} className="h-4 p-0"></TableCell>
+                </TableRow>
+                <TableRow className="bg-muted/10 hover:bg-muted/10">
+                  <TableCell className="font-semibold sticky left-0 bg-muted/10 z-10 border-r shadow-[1px_0_0_0_var(--border)]">Items Subtotal</TableCell>
+                  {renderChargeCells("sub", (b) => ({ note: null, amount: formatCurrency(b.itemsSubtotal), amountClass: "font-semibold" }))}
+                </TableRow>
+                {CHARGE_KEYS.map((key) => (
+                  <TableRow key={`charge-${key}`} className="hover:bg-muted/10">
+                    <TableCell className="font-medium text-muted-foreground sticky left-0 bg-background z-10 border-r shadow-[1px_0_0_0_var(--border)]">{CHARGE_LABELS[key]}</TableCell>
+                    {renderChargeCells(key, (b) => {
+                      const line = b.lines.find((l) => l.key === key)!
+                      const note =
+                        line.itemisedAmount > 0 ? `Already listed as an item above (${formatCurrency(line.itemisedAmount)}) — not added again`
+                        : line.waived ? `${line.basis} — no charge`
+                        : line.basis ?? "Not stated"
+                      return { note, amount: line.itemisedAmount > 0 || !line.basis ? "-" : formatCurrency(line.amount) }
+                    })}
+                  </TableRow>
+                ))}
+                <TableRow className="bg-muted/10 hover:bg-muted/10">
+                  <TableCell className="font-semibold sticky left-0 bg-muted/10 z-10 border-r shadow-[1px_0_0_0_var(--border)]">Total before GST</TableCell>
+                  {renderChargeCells("taxable", (b) => ({ note: null, amount: formatCurrency(b.taxableValue), amountClass: "font-semibold" }))}
+                </TableRow>
+                <TableRow className="hover:bg-muted/10">
+                  <TableCell className="font-medium text-muted-foreground sticky left-0 bg-background z-10 border-r shadow-[1px_0_0_0_var(--border)]">GST</TableCell>
+                  {renderChargeCells("gst", (b) => {
+                    const { gst } = b
+                    const note = gst.included
+                      ? `${gst.basis} — already included in the prices above, nothing added`
+                      : gst.rate != null
+                        ? `${gst.rate}% of ${formatCurrency(b.taxableValue)} (calculated)`
+                        : gst.basis
+                          ? `${gst.basis} — amount as stated by vendor, rate unknown`
+                          : <span className="text-amber-600">GST not stated — not included in the total below</span>
+                    return { note, amount: gst.basis || gst.amount ? formatCurrency(gst.amount) : "-" }
+                  })}
+                </TableRow>
               </TableBody>
               <TableFooter className="bg-primary/5 border-t-2 font-bold">
                 <TableRow>
                   <TableCell className="text-right text-base sticky left-0 bg-primary/5 z-10 border-r shadow-[1px_0_0_0_var(--border)]">
-                    GRAND TOTAL
+                    GRAND TOTAL <span className="block text-[10px] font-normal text-muted-foreground">(incl. GST)</span>
                   </TableCell>
                   {comparison.vendors.map(v => {
-                    const gt = comparison.grandTotals.find(g => g.quotationId === v.id)?.total
+                    const b = vendorCharges.get(v.id)
+                    const quoted = comparison.grandTotals.find(g => g.quotationId === v.id)?.total ?? null
+                    const diff = b && quoted != null ? b.grandTotal - quoted : null
                     const isLowest = summary?.lowestVendor === v.vendorName
                     return (
-                      <TableCell key={`gt-${v.id}`} colSpan={6} className={`border-l text-right text-lg pr-4 tabular-nums ${isLowest ? 'text-emerald-600 dark:text-emerald-400 bg-emerald-100/50 dark:bg-emerald-900/30' : ''}`}>
-                        {formatCurrency(gt)}
+                      <TableCell key={`gt-${v.id}`} colSpan={6} className={`border-l text-right pr-4 tabular-nums ${isLowest ? 'text-emerald-600 dark:text-emerald-400 bg-emerald-100/50 dark:bg-emerald-900/30' : ''}`}>
+                        <div className="text-lg">{formatCurrency(b?.grandTotal)}</div>
+                        {diff != null && (
+                          <div className={`text-[10px] font-normal ${Math.abs(diff) < 1 ? 'text-emerald-600' : 'text-amber-600'}`}>
+                            {Math.abs(diff) < 1
+                              ? `✓ Matches the vendor's quoted total (${formatCurrency(quoted)})`
+                              : `⚠ Vendor quoted ${formatCurrency(quoted)} — our calculation is ${formatCurrency(Math.abs(diff))} ${diff < 0 ? 'lower' : 'higher'}`}
+                          </div>
+                        )}
                       </TableCell>
                     )
                   })}
