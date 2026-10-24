@@ -41,7 +41,7 @@ import {
   ChevronDown
 } from "lucide-react"
 import { ExportPreviewModal } from "@/components/ExportPreviewModal"
-import { computeCharges, CHARGE_KEYS, CHARGE_LABELS, type ChargeBreakdown } from "@/lib/charges"
+import { resolveVendorInComparison, CHARGE_LABELS, TOTAL_TOLERANCE, type VendorComparisonResolution, type ResolvedItem } from "@/lib/charges"
 
 // Currency formatter
 const formatCurrency = (amount: number | null | undefined) => {
@@ -49,8 +49,18 @@ const formatCurrency = (amount: number | null | undefined) => {
   return '₹ ' + new Intl.NumberFormat('en-IN', { maximumFractionDigits: 2 }).format(amount)
 }
 
-// The monetary rows are calculated (see computeCharges), so they're left out of the plain-text terms rows.
+// GST, freight, installation and designing are columns on every row (see resolveVendorInComparison),
+// so they're left out of the plain-text terms rows.
 const CHARGE_LABEL_SET = new Set<string>(Object.values(CHARGE_LABELS))
+
+// Columns per vendor: Spec | Qty | MRP | Rate | Disc % | GST % | Freight | Other | Total
+const COLS_PER_VENDOR = 9
+
+const uniformOf = <T,>(values: T[]): T | null =>
+  values.length > 0 && values.every((v) => v === values[0]) ? values[0] : null
+const sumOf = (items: ResolvedItem[], pick: (r: ResolvedItem) => number) =>
+  Math.round(items.reduce((a, r) => a + pick(r), 0) * 100) / 100
+const moneyOrDash = (n: number) => (n > 0 ? formatCurrency(n) : '-')
 
 export function ProjectDetail() {
   const params = useParams()
@@ -90,26 +100,32 @@ export function ProjectDetail() {
     query: { queryKey: getGetComparisonQueryKey(projectId), enabled: !!projectId && hasParsedQuotations }
   })
 
-  // Our own calculation of each vendor's subtotal, charges, GST and grand total — vendors make
-  // arithmetic mistakes, so the total printed on their document is only kept as a cross-check.
-  const vendorCharges = useMemo(() => {
-    const m = new Map<number, ChargeBreakdown>()
+  // Our own calculation of every row's GST, freight, other charges and total, and each vendor's grand
+  // total — vendors make arithmetic mistakes, so the total printed on their document is only a cross-check.
+  const resolutions = useMemo(() => {
+    const m = new Map<number, VendorComparisonResolution>()
     if (!comparison) return m
-    for (const vd of comparison.vendorDetails ?? []) {
-      const id = vd.quotationId
-      const items = [
-        ...comparison.rows.flatMap((r) => r.vendors.find((v) => v.quotationId === id)?.lineItems ?? []),
-        ...comparison.otherItems.filter((o) => o.quotationId === id),
-      ]
-      const info: Partial<Record<"gst" | (typeof CHARGE_KEYS)[number], string | null>> = {}
-      for (const key of [...CHARGE_KEYS, "gst" as const]) {
-        const row = comparison.additionalInfo.find((a) => a.label === CHARGE_LABELS[key])
-        info[key] = row?.vendors.find((iv) => iv.quotationId === id)?.value ?? null
-      }
-      m.set(id, computeCharges(items, info))
-    }
+    for (const vd of comparison.vendorDetails ?? []) m.set(vd.quotationId, resolveVendorInComparison(comparison, vd.quotationId))
     return m
   }, [comparison])
+
+  // Lump-sum charges (freight etc.) any vendor quoted below their items; each gets its own row.
+  const lumpKeys = useMemo(
+    () => (["designingCharges", "freight", "installation"] as const).filter((k) =>
+      [...resolutions.values()].some((r) => r.lumpCharges.some((l) => l.key === k))),
+    [resolutions],
+  )
+
+  // Resolved values for each entry of comparison.otherItems (same order)
+  const otherResolved = useMemo(() => {
+    if (!comparison) return []
+    const seen = new Map<number, number>()
+    return comparison.otherItems.map((o) => {
+      const n = seen.get(o.quotationId) ?? 0
+      seen.set(o.quotationId, n + 1)
+      return resolutions.get(o.quotationId)?.otherResolved[n]
+    })
+  }, [comparison, resolutions])
 
   const deleteQuotation = useDeleteQuotation()
   const setBenchmark = useSetBenchmark()
@@ -182,25 +198,6 @@ export function ProjectDetail() {
   }
 
   if (!project) return <div>Project not found</div>
-
-  // One vendor-wide row of the charges block: a note across Spec..Disc and the amount under Total.
-  const renderChargeCells = (
-    rowKey: string,
-    cellFor: (b: ChargeBreakdown) => { note: React.ReactNode; amount: React.ReactNode; amountClass?: string },
-  ) =>
-    (comparison?.vendors ?? []).map((v) => {
-      const b = vendorCharges.get(v.id)
-      if (!b) {
-        return <TableCell key={`${rowKey}-${v.id}`} colSpan={6} className="border-l text-center text-muted-foreground/40">-</TableCell>
-      }
-      const c = cellFor(b)
-      return (
-        <React.Fragment key={`${rowKey}-${v.id}`}>
-          <TableCell colSpan={5} className="border-l text-xs text-muted-foreground px-4 whitespace-normal">{c.note}</TableCell>
-          <TableCell className={`text-right tabular-nums pr-4 ${c.amountClass ?? ""}`}>{c.amount}</TableCell>
-        </React.Fragment>
-      )
-    })
 
   return (
     <div className="space-y-6 pb-20 animate-in fade-in duration-300">
@@ -360,7 +357,7 @@ export function ProjectDetail() {
                 <TableRow>
                   <TableHead className="w-[300px] sticky left-0 bg-muted/95 backdrop-blur z-20 border-r shadow-[1px_0_0_0_var(--border)]">Item / Description</TableHead>
                   {(comparison.vendorDetails ?? comparison.vendors.map((v: any) => ({ quotationId: v.id, vendorName: v.vendorName, isBenchmark: v.isBenchmark, vendorAddress: null, vendorContact: null }))).map((vd: any) => (
-                    <TableHead key={vd.quotationId} className="text-center border-l bg-muted/30 align-top py-3" colSpan={6}>
+                    <TableHead key={vd.quotationId} className="text-center border-l bg-muted/30 align-top py-3" colSpan={COLS_PER_VENDOR}>
                       <div className="font-semibold text-foreground text-sm">{vd.vendorName}</div>
                       {vd.vendorAddress && (
                         <div className="text-[10px] text-muted-foreground font-normal mt-0.5 max-w-[240px] mx-auto whitespace-normal leading-tight">
@@ -386,6 +383,9 @@ export function ProjectDetail() {
                       <TableHead className="text-right text-xs w-24">MRP</TableHead>
                       <TableHead className="text-right text-xs w-28">Rate</TableHead>
                       <TableHead className="text-right text-xs w-16">Disc %</TableHead>
+                      <TableHead className="text-right text-xs w-16">GST %</TableHead>
+                      <TableHead className="text-right text-xs w-24">Freight</TableHead>
+                      <TableHead className="text-right text-xs w-24">Other</TableHead>
                       <TableHead className="text-right text-xs pr-4 w-28">Total</TableHead>
                     </React.Fragment>
                   ))}
@@ -393,9 +393,12 @@ export function ProjectDetail() {
               </TableHeader>
               <TableBody>
                 {comparison.rows.map((row, rIdx) => {
+                  // This vendor's resolved (all-in) line items for this row
+                  const rowRes = (qid: number) => resolutions.get(qid)?.rowItems[rIdx] ?? []
                   let minTotal = Infinity;
                   row.vendors.forEach(v => {
-                    if (v.totalPrice !== null && v.totalPrice !== undefined && v.totalPrice < minTotal) minTotal = v.totalPrice;
+                    const r = rowRes(v.quotationId)
+                    if (v.available && r.length > 0) minTotal = Math.min(minTotal, sumOf(r, (x) => x.total))
                   })
 
                   const hasVariants = row.vendors.some(v => v.lineItems.length > 1)
@@ -420,15 +423,16 @@ export function ProjectDetail() {
                       </TableCell>
 
                       {row.vendors.map(v => {
-                        const isLowest = v.available && v.totalPrice === minTotal && minTotal !== Infinity;
+                        const resolved = rowRes(v.quotationId)
+                        const rowTotal = sumOf(resolved, (x) => x.total)
+                        const isLowest = v.available && resolved.length > 0 && rowTotal === minTotal && minTotal !== Infinity;
                         if (!v.available) {
                           return (
                             <React.Fragment key={v.quotationId}>
                               <TableCell className="border-l text-center text-muted-foreground/40">-</TableCell>
-                              <TableCell className="text-center text-muted-foreground/40">-</TableCell>
-                              <TableCell className="text-center text-muted-foreground/40">-</TableCell>
-                              <TableCell className="text-center text-muted-foreground/40">-</TableCell>
-                              <TableCell className="text-center text-muted-foreground/40">-</TableCell>
+                              {Array.from({ length: COLS_PER_VENDOR - 2 }).map((_, i) => (
+                                <TableCell key={i} className="text-center text-muted-foreground/40">-</TableCell>
+                              ))}
                               <TableCell className="text-center text-muted-foreground/40 pr-4">-</TableCell>
                             </React.Fragment>
                           )
@@ -450,8 +454,17 @@ export function ProjectDetail() {
                             <TableCell className="text-right tabular-nums text-muted-foreground">
                               {v.discountPercent != null ? `${v.discountPercent}%` : '-'}
                             </TableCell>
+                            <TableCell className="text-right tabular-nums text-muted-foreground">
+                              {(() => { const g = uniformOf(resolved.map((x) => x.gstPercent)); return g != null ? `${g}%` : '-' })()}
+                            </TableCell>
+                            <TableCell className="text-right tabular-nums text-muted-foreground">
+                              {moneyOrDash(sumOf(resolved, (x) => x.freight))}
+                            </TableCell>
+                            <TableCell className="text-right tabular-nums text-muted-foreground">
+                              {moneyOrDash(sumOf(resolved, (x) => x.otherCharges))}
+                            </TableCell>
                             <TableCell className={`text-right tabular-nums pr-4 font-medium ${isLowest ? 'text-emerald-600 bg-emerald-50/50 dark:text-emerald-400 dark:bg-emerald-950/20' : ''}`}>
-                              {formatCurrency(v.totalPrice)}
+                              {formatCurrency(rowTotal)}
                             </TableCell>
                           </React.Fragment>
                         )
@@ -460,11 +473,11 @@ export function ProjectDetail() {
 
                     {hasVariants && isExpanded && (
                       <TableRow className="bg-muted/5 hover:bg-muted/5">
-                        <TableCell className="sticky left-0 bg-muted/5 z-10 border-r shadow-[1px_0_0_0_var(--border)] align-top text-xs text-muted-foreground pl-5 py-2">
+                        <TableCell className="sticky left-0 bg-background z-10 border-r shadow-[1px_0_0_0_var(--border)] align-top text-xs text-muted-foreground pl-5 py-2">
                           Size / variant breakdown
                         </TableCell>
                         {row.vendors.map(v => (
-                          <TableCell key={`variants-${v.quotationId}`} colSpan={6} className="border-l align-top p-0">
+                          <TableCell key={`variants-${v.quotationId}`} colSpan={COLS_PER_VENDOR} className="border-l align-top p-0">
                             {v.lineItems.length > 0 ? (
                               <table className="w-full text-xs">
                                 <tbody>
@@ -477,7 +490,10 @@ export function ProjectDetail() {
                                       <td className="py-1 px-2 text-right tabular-nums text-muted-foreground w-20">{formatCurrency(item.mrp)}</td>
                                       <td className="py-1 px-2 text-right tabular-nums text-muted-foreground w-24">{formatCurrency(item.unitPrice)}</td>
                                       <td className="py-1 px-2 text-right tabular-nums text-muted-foreground w-14">{item.discountPercent != null ? `${item.discountPercent}%` : '-'}</td>
-                                      <td className="py-1 px-4 text-right tabular-nums font-medium w-24">{formatCurrency(item.totalPrice)}</td>
+                                      <td className="py-1 px-2 text-right tabular-nums text-muted-foreground w-14">{rowRes(v.quotationId)[li] ? `${rowRes(v.quotationId)[li].gstPercent}%` : '-'}</td>
+                                      <td className="py-1 px-2 text-right tabular-nums text-muted-foreground w-20">{moneyOrDash(rowRes(v.quotationId)[li]?.freight ?? 0)}</td>
+                                      <td className="py-1 px-2 text-right tabular-nums text-muted-foreground w-20">{moneyOrDash(rowRes(v.quotationId)[li]?.otherCharges ?? 0)}</td>
+                                      <td className="py-1 px-4 text-right tabular-nums font-medium w-24">{formatCurrency(rowRes(v.quotationId)[li]?.total ?? item.totalPrice)}</td>
                                     </tr>
                                   ))}
                                 </tbody>
@@ -493,21 +509,49 @@ export function ProjectDetail() {
                   )
                 })}
 
+                {/* Lump-sum charges quoted below the items — their own rows, included in the totals */}
+                {lumpKeys.map((key) => (
+                  <TableRow key={`lump-${key}`} className="bg-muted/5 hover:bg-muted/10">
+                    <TableCell className="font-medium text-muted-foreground sticky left-0 bg-background z-10 border-r shadow-[1px_0_0_0_var(--border)]">
+                      {CHARGE_LABELS[key]}
+                    </TableCell>
+                    {comparison.vendors.map((v) => {
+                      const lump = resolutions.get(v.id)?.lumpCharges.find((l) => l.key === key)
+                      if (!lump) {
+                        return <TableCell key={`lump-${key}-${v.id}`} colSpan={COLS_PER_VENDOR} className="border-l text-center text-muted-foreground/40">-</TableCell>
+                      }
+                      return (
+                        <React.Fragment key={`lump-${key}-${v.id}`}>
+                          <TableCell colSpan={5} className="border-l text-xs text-muted-foreground px-4 whitespace-normal min-w-[260px]">
+                            {lump.basis ? `As quoted: ${lump.basis}` : ''}
+                            {lump.status === 'included' && ' — no separate charge'}
+                            {lump.status === 'unclear' && <span className="text-amber-600"> — no lump amount stated, nothing added</span>}
+                          </TableCell>
+                          <TableCell className="text-right tabular-nums text-muted-foreground">{lump.status === 'amount' ? `${lump.gstPercent}%` : '-'}</TableCell>
+                          <TableCell className="text-right tabular-nums text-muted-foreground">{key === 'freight' && lump.status === 'amount' ? formatCurrency(lump.amount) : '-'}</TableCell>
+                          <TableCell className="text-right tabular-nums text-muted-foreground">{key !== 'freight' && lump.status === 'amount' ? formatCurrency(lump.amount) : '-'}</TableCell>
+                          <TableCell className="text-right tabular-nums pr-4 font-medium">{lump.status === 'amount' ? formatCurrency(lump.total) : '-'}</TableCell>
+                        </React.Fragment>
+                      )
+                    })}
+                  </TableRow>
+                ))}
+
                 {/* Additional Info Rows */}
                 {comparison.additionalInfo.length > 0 && (
                   <>
                     <TableRow className="border-t-2">
-                      <TableCell colSpan={1 + comparison.vendors.length * 6} className="h-4 p-0"></TableCell>
+                      <TableCell colSpan={1 + comparison.vendors.length * COLS_PER_VENDOR} className="h-4 p-0"></TableCell>
                     </TableRow>
                     {comparison.additionalInfo.filter((info) => !CHARGE_LABEL_SET.has(info.label)).map((info, idx) => (
                       <TableRow key={`info-${idx}`} className="bg-muted/5 hover:bg-muted/10">
-                        <TableCell className="font-medium text-muted-foreground sticky left-0 bg-muted/5 z-10 border-r shadow-[1px_0_0_0_var(--border)]">
+                        <TableCell className="font-medium text-muted-foreground sticky left-0 bg-background z-10 border-r shadow-[1px_0_0_0_var(--border)]">
                           {info.label}
                         </TableCell>
                         {comparison.vendors.map(v => {
                           const val = info.vendors.find(iv => iv.quotationId === v.id)?.value
                           return (
-                            <TableCell key={`info-${idx}-${v.id}`} colSpan={6} className="border-l text-left text-sm text-muted-foreground px-4">
+                            <TableCell key={`info-${idx}-${v.id}`} colSpan={COLS_PER_VENDOR} className="border-l text-left text-sm text-muted-foreground px-4">
                               {val || '-'}
                             </TableCell>
                           )
@@ -517,45 +561,6 @@ export function ProjectDetail() {
                   </>
                 )}
 
-                {/* Charges & totals — calculated from the line items and the charges each vendor quoted */}
-                <TableRow className="border-t-2">
-                  <TableCell colSpan={1 + comparison.vendors.length * 6} className="h-4 p-0"></TableCell>
-                </TableRow>
-                <TableRow className="bg-muted/10 hover:bg-muted/10">
-                  <TableCell className="font-semibold sticky left-0 bg-muted/10 z-10 border-r shadow-[1px_0_0_0_var(--border)]">Items Subtotal</TableCell>
-                  {renderChargeCells("sub", (b) => ({ note: null, amount: formatCurrency(b.itemsSubtotal), amountClass: "font-semibold" }))}
-                </TableRow>
-                {CHARGE_KEYS.map((key) => (
-                  <TableRow key={`charge-${key}`} className="hover:bg-muted/10">
-                    <TableCell className="font-medium text-muted-foreground sticky left-0 bg-background z-10 border-r shadow-[1px_0_0_0_var(--border)]">{CHARGE_LABELS[key]}</TableCell>
-                    {renderChargeCells(key, (b) => {
-                      const line = b.lines.find((l) => l.key === key)!
-                      const note =
-                        line.itemisedAmount > 0 ? `Already listed as an item above (${formatCurrency(line.itemisedAmount)}) — not added again`
-                        : line.waived ? `${line.basis} — no charge`
-                        : line.basis ?? "Not stated"
-                      return { note, amount: line.itemisedAmount > 0 || !line.basis ? "-" : formatCurrency(line.amount) }
-                    })}
-                  </TableRow>
-                ))}
-                <TableRow className="bg-muted/10 hover:bg-muted/10">
-                  <TableCell className="font-semibold sticky left-0 bg-muted/10 z-10 border-r shadow-[1px_0_0_0_var(--border)]">Total before GST</TableCell>
-                  {renderChargeCells("taxable", (b) => ({ note: null, amount: formatCurrency(b.taxableValue), amountClass: "font-semibold" }))}
-                </TableRow>
-                <TableRow className="hover:bg-muted/10">
-                  <TableCell className="font-medium text-muted-foreground sticky left-0 bg-background z-10 border-r shadow-[1px_0_0_0_var(--border)]">GST</TableCell>
-                  {renderChargeCells("gst", (b) => {
-                    const { gst } = b
-                    const note = gst.included
-                      ? `${gst.basis} — already included in the prices above, nothing added`
-                      : gst.rate != null
-                        ? `${gst.rate}% of ${formatCurrency(b.taxableValue)} (calculated)`
-                        : gst.basis
-                          ? `${gst.basis} — amount as stated by vendor, rate unknown`
-                          : <span className="text-amber-600">GST not stated — not included in the total below</span>
-                    return { note, amount: gst.basis || gst.amount ? formatCurrency(gst.amount) : "-" }
-                  })}
-                </TableRow>
               </TableBody>
               <TableFooter className="bg-primary/5 border-t-2 font-bold">
                 <TableRow>
@@ -563,16 +568,29 @@ export function ProjectDetail() {
                     GRAND TOTAL <span className="block text-[10px] font-normal text-muted-foreground">(incl. GST)</span>
                   </TableCell>
                   {comparison.vendors.map(v => {
-                    const b = vendorCharges.get(v.id)
+                    const r = resolutions.get(v.id)
                     const quoted = comparison.grandTotals.find(g => g.quotationId === v.id)?.total ?? null
-                    const diff = b && quoted != null ? b.grandTotal - quoted : null
+                    const diff = r && quoted != null ? r.grandTotal - quoted : null
                     const isLowest = summary?.lowestVendor === v.vendorName
                     return (
-                      <TableCell key={`gt-${v.id}`} colSpan={6} className={`border-l text-right pr-4 tabular-nums ${isLowest ? 'text-emerald-600 dark:text-emerald-400 bg-emerald-100/50 dark:bg-emerald-900/30' : ''}`}>
-                        <div className="text-lg">{formatCurrency(b?.grandTotal)}</div>
+                      <TableCell key={`gt-${v.id}`} colSpan={COLS_PER_VENDOR} className={`border-l text-right pr-4 tabular-nums ${isLowest ? 'text-emerald-600 dark:text-emerald-400 bg-emerald-100/50 dark:bg-emerald-900/30' : ''}`}>
+                        <div className="text-lg">{formatCurrency(r?.grandTotal)}</div>
+                        {r && (
+                          <div className="text-[10px] font-normal text-muted-foreground">
+                            Items {formatCurrency(r.baseTotal)}
+                            {r.freightTotal > 0 && ` + Freight ${formatCurrency(r.freightTotal)}`}
+                            {r.otherTotal > 0 && ` + Other ${formatCurrency(r.otherTotal)}`}
+                            {` + GST ${formatCurrency(r.gstTotal)}`}
+                          </div>
+                        )}
+                        {r?.charges.gst.assumed && (
+                          <div className="text-[10px] font-normal text-amber-600">
+                            Vendor didn't state GST — standard {r.charges.gst.rate}% assumed
+                          </div>
+                        )}
                         {diff != null && (
-                          <div className={`text-[10px] font-normal ${Math.abs(diff) < 1 ? 'text-emerald-600' : 'text-amber-600'}`}>
-                            {Math.abs(diff) < 1
+                          <div className={`text-[10px] font-normal ${Math.abs(diff) <= TOTAL_TOLERANCE ? 'text-emerald-600' : 'text-amber-600'}`}>
+                            {Math.abs(diff) <= TOTAL_TOLERANCE
                               ? `✓ Matches the vendor's quoted total (${formatCurrency(quoted)})`
                               : `⚠ Vendor quoted ${formatCurrency(quoted)} — our calculation is ${formatCurrency(Math.abs(diff))} ${diff < 0 ? 'lower' : 'higher'}`}
                           </div>
@@ -606,6 +624,9 @@ export function ProjectDetail() {
                     <TableHead className="text-right">MRP</TableHead>
                     <TableHead className="text-right">Rate</TableHead>
                     <TableHead className="text-right">Disc %</TableHead>
+                    <TableHead className="text-right">GST %</TableHead>
+                    <TableHead className="text-right">Freight</TableHead>
+                    <TableHead className="text-right">Other</TableHead>
                     <TableHead className="text-right">Total</TableHead>
                   </TableRow>
                 </TableHeader>
@@ -619,7 +640,10 @@ export function ProjectDetail() {
                       <TableCell className="text-right tabular-nums">{formatCurrency(item.mrp)}</TableCell>
                       <TableCell className="text-right tabular-nums">{formatCurrency(item.unitPrice)}</TableCell>
                       <TableCell className="text-right tabular-nums">{item.discountPercent != null ? `${item.discountPercent}%` : '-'}</TableCell>
-                      <TableCell className="text-right tabular-nums font-medium">{formatCurrency(item.totalPrice)}</TableCell>
+                      <TableCell className="text-right tabular-nums">{otherResolved[idx] ? `${otherResolved[idx]!.gstPercent}%` : '-'}</TableCell>
+                      <TableCell className="text-right tabular-nums">{moneyOrDash(otherResolved[idx]?.freight ?? 0)}</TableCell>
+                      <TableCell className="text-right tabular-nums">{moneyOrDash(otherResolved[idx]?.otherCharges ?? 0)}</TableCell>
+                      <TableCell className="text-right tabular-nums font-medium">{formatCurrency(otherResolved[idx]?.total ?? item.totalPrice)}</TableCell>
                     </TableRow>
                   ))}
                 </TableBody>

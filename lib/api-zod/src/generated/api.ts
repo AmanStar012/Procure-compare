@@ -35,6 +35,9 @@ export const ListProjectsResponseItem = zod.object({
   "mrp": zod.string().optional(),
   "unitPrice": zod.string().optional(),
   "discountPercent": zod.string().optional(),
+  "gstPercent": zod.string().optional(),
+  "freight": zod.string().optional(),
+  "otherCharges": zod.string().optional(),
   "totalPrice": zod.string().optional()
 }).describe('Overrides for the built-in comparison table headers. Omitted keys keep their default label.'),
   "createdAt": zod.string(),
@@ -72,6 +75,9 @@ export const CreateProjectResponse = zod.object({
   "mrp": zod.string().optional(),
   "unitPrice": zod.string().optional(),
   "discountPercent": zod.string().optional(),
+  "gstPercent": zod.string().optional(),
+  "freight": zod.string().optional(),
+  "otherCharges": zod.string().optional(),
   "totalPrice": zod.string().optional()
 }).describe('Overrides for the built-in comparison table headers. Omitted keys keep their default label.'),
   "createdAt": zod.string(),
@@ -102,6 +108,9 @@ export const GetProjectResponse = zod.object({
   "mrp": zod.string().optional(),
   "unitPrice": zod.string().optional(),
   "discountPercent": zod.string().optional(),
+  "gstPercent": zod.string().optional(),
+  "freight": zod.string().optional(),
+  "otherCharges": zod.string().optional(),
   "totalPrice": zod.string().optional()
 }).describe('Overrides for the built-in comparison table headers. Omitted keys keep their default label.'),
   "createdAt": zod.string(),
@@ -146,6 +155,9 @@ export const UpdateProjectBody = zod.object({
   "mrp": zod.string().optional(),
   "unitPrice": zod.string().optional(),
   "discountPercent": zod.string().optional(),
+  "gstPercent": zod.string().optional(),
+  "freight": zod.string().optional(),
+  "otherCharges": zod.string().optional(),
   "totalPrice": zod.string().optional()
 }).optional().describe('Overrides for the built-in comparison table headers. Omitted keys keep their default label.')
 })
@@ -165,6 +177,9 @@ export const UpdateProjectResponse = zod.object({
   "mrp": zod.string().optional(),
   "unitPrice": zod.string().optional(),
   "discountPercent": zod.string().optional(),
+  "gstPercent": zod.string().optional(),
+  "freight": zod.string().optional(),
+  "otherCharges": zod.string().optional(),
   "totalPrice": zod.string().optional()
 }).describe('Overrides for the built-in comparison table headers. Omitted keys keep their default label.'),
   "createdAt": zod.string(),
@@ -226,6 +241,9 @@ export const UpdateQuotationBody = zod.object({
   "unitPrice": zod.number(),
   "discountPercent": zod.number().nullish(),
   "totalPrice": zod.number(),
+  "gstPercent": zod.number().nullish().describe('GST rate (%) for this line. Null means use the vendor\'s stated rate (or 18% if none was stated).'),
+  "freight": zod.number().nullish().describe('Freight\/cartage charge for this line. Null means use this line\'s share of any lump-sum freight the vendor quoted.'),
+  "otherCharges": zod.number().nullish().describe('Installation\/designing\/other charge for this line. Null means use this line\'s share of any lump-sum charges the vendor quoted.'),
   "format": zod.record(zod.string(), zod.object({
   "bold": zod.boolean().optional(),
   "italic": zod.boolean().optional(),
@@ -295,6 +313,9 @@ export const SetBenchmarkResponse = zod.object({
   "mrp": zod.string().optional(),
   "unitPrice": zod.string().optional(),
   "discountPercent": zod.string().optional(),
+  "gstPercent": zod.string().optional(),
+  "freight": zod.string().optional(),
+  "otherCharges": zod.string().optional(),
   "totalPrice": zod.string().optional()
 }).describe('Overrides for the built-in comparison table headers. Omitted keys keep their default label.'),
   "createdAt": zod.string(),
@@ -352,6 +373,9 @@ export const GetComparisonResponse = zod.object({
   "unitPrice": zod.number(),
   "discountPercent": zod.number().nullish(),
   "totalPrice": zod.number(),
+  "gstPercent": zod.number().nullish().describe('GST rate (%) for this line. Null means use the vendor\'s stated rate (or 18% if none was stated).'),
+  "freight": zod.number().nullish().describe('Freight\/cartage charge for this line. Null means use this line\'s share of any lump-sum freight the vendor quoted.'),
+  "otherCharges": zod.number().nullish().describe('Installation\/designing\/other charge for this line. Null means use this line\'s share of any lump-sum charges the vendor quoted.'),
   "format": zod.record(zod.string(), zod.object({
   "bold": zod.boolean().optional(),
   "italic": zod.boolean().optional(),
@@ -372,6 +396,9 @@ export const GetComparisonResponse = zod.object({
   "unitPrice": zod.number(),
   "discountPercent": zod.number().nullish(),
   "totalPrice": zod.number(),
+  "gstPercent": zod.number().nullish().describe('GST rate (%) for this line. Null means use the vendor\'s stated rate (or 18% if none was stated).'),
+  "freight": zod.number().nullish().describe('Freight\/cartage charge for this line. Null means use this line\'s share of any lump-sum freight the vendor quoted.'),
+  "otherCharges": zod.number().nullish().describe('Installation\/designing\/other charge for this line. Null means use this line\'s share of any lump-sum charges the vendor quoted.'),
   "format": zod.record(zod.string(), zod.object({
   "bold": zod.boolean().optional(),
   "italic": zod.boolean().optional(),

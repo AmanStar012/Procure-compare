@@ -9,6 +9,9 @@ export interface VendorLineItem {
   unitPrice: number;
   discountPercent: number | null;
   totalPrice: number;
+  gstPercent?: number | null;
+  freight?: number | null;
+  otherCharges?: number | null;
   format?: ItemFormatMap;
   customFields?: Record<string, string>;
 }
@@ -42,6 +45,9 @@ export interface OtherItem {
   unitPrice: number;
   discountPercent: number | null;
   totalPrice: number;
+  gstPercent?: number | null;
+  freight?: number | null;
+  otherCharges?: number | null;
   format?: ItemFormatMap;
   customFields?: Record<string, string>;
 }
@@ -116,6 +122,9 @@ export function buildComparison(projectId: number, quotations: Quotation[], targ
         unitPrice: item.unitPrice,
         discountPercent: item.discountPercent,
         totalPrice: item.totalPrice,
+        gstPercent: item.gstPercent ?? null,
+        freight: item.freight ?? null,
+        otherCharges: item.otherCharges ?? null,
         format: item.format,
         customFields: item.customFields,
       }));
@@ -170,6 +179,9 @@ export function buildComparison(projectId: number, quotations: Quotation[], targ
         unitPrice: item.unitPrice,
         discountPercent: item.discountPercent,
         totalPrice: item.totalPrice,
+        gstPercent: item.gstPercent ?? null,
+        freight: item.freight ?? null,
+        otherCharges: item.otherCharges ?? null,
         format: item.format,
         customFields: item.customFields,
       })),

@@ -29,6 +29,11 @@ export interface ParsedItem {
   totalPrice: number;
   format?: ItemFormatMap; // per-column text styling set by the user in the grid editor — never set by AI extraction
   customFields?: Record<string, string>; // values for the project's custom shared columns, keyed by CustomColumn id
+  // Per-row charge columns. Null/absent means "use the default" (vendor's GST rate or 18%, and this row's share
+  // of any lump-sum charges); a number is a value the user typed for this row. Never set by AI extraction.
+  gstPercent?: number | null;
+  freight?: number | null;
+  otherCharges?: number | null;
 }
 
 export interface AdditionalInfo {
@@ -109,7 +114,7 @@ function buildExtractionTool(targetItems: string[]): Anthropic.Tool {
           type: "object",
           properties: {
             designingCharges: { type: ["string", "null"], description: "Designing charges as quoted (e.g. '₹5,000' or '2%'), or null if absent or already captured as a priced line item" },
-            gst: { type: ["string", "null"], description: "The GST rate or wording exactly as quoted (e.g. 'IGST @ 18%', 'Inclusive of GST'). Do not put the vendor's computed GST amount here when a percentage is given." },
+            gst: { type: ["string", "null"], description: "The GST rate or wording exactly as quoted (e.g. 'IGST @ 18%', 'CGST 9% + SGST 9%', 'Inclusive of GST'). If GST is split into CGST and SGST (or UTGST), keep BOTH parts. Do not put the vendor's computed GST amount here when a percentage is given." },
             installation: { type: ["string", "null"], description: "Installation charges as quoted (e.g. '₹10,000' or '3%'), or null if absent or already captured as a priced line item" },
             freight: { type: ["string", "null"], description: "Freight/cartage charges as quoted (e.g. '₹12,000' or 'Extra at actuals'), or null if absent or already captured as a priced line item" },
             leadTime: { type: ["string", "null"] },

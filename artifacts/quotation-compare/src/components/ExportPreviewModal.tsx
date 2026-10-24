@@ -17,7 +17,7 @@ import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { useToast } from "@/hooks/use-toast"
 import { Download, X, Eye, RotateCcw, Plus, Trash2, Loader2, Save, Bold, Italic, Underline, Highlighter, Columns3, GripVertical } from "lucide-react"
-import { computeCharges, CHARGE_KEYS, CHARGE_LABELS, type ChargeBreakdown, type ChargeKey } from "@/lib/charges"
+import { resolveItems, CHARGE_LABELS, TOTAL_TOLERANCE, type ChargeKey, type VendorResolution, type ResolvedItem } from "@/lib/charges"
 
 // ── Draft (editable) data model ────────────────────────────────────────────
 const ADDITIONAL_INFO_LABELS: Record<string, string> = {
@@ -35,8 +35,8 @@ const LABEL_TO_KEY: Record<string, string> = Object.fromEntries(
 )
 const ADDITIONAL_INFO_KEYS = Object.keys(ADDITIONAL_INFO_LABELS)
 
-// Designing/freight/installation/GST are monetary: they're calculated and shown as rows in
-// the totals block (see computeCharges). Only the remaining terms stay as plain text rows.
+// GST, freight, installation and designing are columns on every item row now (GST %, Freight,
+// Other Charges — see resolveItems). Only the remaining terms stay as plain text rows.
 const CHARGE_LABEL_SET = new Set<string>(Object.values(CHARGE_LABELS))
 const TERMS_INFO_KEYS = ADDITIONAL_INFO_KEYS.filter((k) => !CHARGE_LABEL_SET.has(ADDITIONAL_INFO_LABELS[k]))
 
@@ -46,6 +46,9 @@ const DEFAULT_COL_LABELS: Record<keyof ColumnLabels, string> = {
   mrp: "MRP",
   unitPrice: "Rate",
   discountPercent: "Disc %",
+  gstPercent: "GST %",
+  freight: "Freight",
+  otherCharges: "Other",
   totalPrice: "Total",
 }
 const BUILTIN_COL_KEYS = Object.keys(DEFAULT_COL_LABELS) as (keyof ColumnLabels)[]
@@ -55,12 +58,15 @@ const BUILTIN_COL_KEYS = Object.keys(DEFAULT_COL_LABELS) as (keyof ColumnLabels)
 // used independent, mismatched % widths inside separate <table> elements).
 const CATEGORY_COL_WIDTH = 180
 const COL_WIDTH: Record<keyof ColumnLabels, number> = {
-  spec: 220,
+  spec: 200,
   qty: 60,
   mrp: 84,
   unitPrice: 84,
   discountPercent: 70,
-  totalPrice: 100,
+  gstPercent: 78,
+  freight: 84,
+  otherCharges: 84,
+  totalPrice: 108,
 }
 const CUSTOM_COL_WIDTH = 96
 
@@ -84,7 +90,12 @@ interface DraftItem {
   mrp: number | null
   unitPrice: number
   discountPercent: number | null
-  totalPrice: number
+  totalPrice: number // the line amount before freight, other charges and GST
+  // Per-row charge columns. null = use the default (vendor's GST rate or 18%, and this row's share of
+  // any lump-sum charges the vendor quoted); a number is a value typed for this row.
+  gstPercent: number | null
+  freight: number | null
+  otherCharges: number | null
   format: ItemFormatMap
   customFields: Record<string, string>
 }
@@ -122,6 +133,9 @@ function buildInitialDraft(comparison: ComparisonResult, doneVendors: Comparison
           unitPrice: li.unitPrice,
           discountPercent: li.discountPercent ?? null,
           totalPrice: li.totalPrice,
+          gstPercent: li.gstPercent ?? null,
+          freight: li.freight ?? null,
+          otherCharges: li.otherCharges ?? null,
           format: { ...(li as any).format },
           customFields: { ...(li as any).customFields },
         })
@@ -139,6 +153,9 @@ function buildInitialDraft(comparison: ComparisonResult, doneVendors: Comparison
         unitPrice: oi.unitPrice,
         discountPercent: oi.discountPercent ?? null,
         totalPrice: oi.totalPrice,
+        gstPercent: oi.gstPercent ?? null,
+        freight: oi.freight ?? null,
+        otherCharges: oi.otherCharges ?? null,
         format: { ...(oi as any).format },
         customFields: { ...(oi as any).customFields },
       })
@@ -222,12 +239,13 @@ interface FormatCellProps {
   type?: "text" | "number"
   placeholder?: string
   inputClassName?: string
+  hint?: string
 }
 
 // One value input + a tiny per-column B/I/U/highlight toolbar that only shows on
 // hover/focus of THIS cell — so formatting targets one column, not the whole row.
 function FormatCell({
-  qid, item, field, value, onChange, onToggleFormat, type = "text", placeholder, inputClassName = "",
+  qid, item, field, value, onChange, onToggleFormat, type = "text", placeholder, inputClassName = "", hint,
 }: FormatCellProps) {
   const [focused, setFocused] = useState(false)
   const [draftText, setDraftText] = useState("")
@@ -264,6 +282,7 @@ function FormatCell({
         placeholder={placeholder}
         className={`${base} ${formatClasses(f)} ${inputClassName}`}
       />
+      {hint && <div className="text-[9px] text-muted-foreground tabular-nums text-right px-1">{hint}</div>}
       <div className="flex items-center gap-0.5 justify-end h-3 opacity-0 group-hover/fc:opacity-100 group-focus-within/fc:opacity-100 transition-opacity">
         <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => onToggleFormat(qid, item.key, field, "bold")} title="Bold" className={btnClass(f?.bold, "bg-primary/20 text-primary")}>
           <Bold className="w-2 h-2" />
@@ -279,6 +298,39 @@ function FormatCell({
         </button>
       </div>
     </div>
+  )
+}
+
+// Small comma-formatted amount input (no per-cell B/I/U toolbar), same typing behaviour as FormatCell.
+function PlainNumberInput({
+  value, onChange, className, placeholder,
+}: {
+  value: string | number
+  onChange: (raw: string) => void
+  className?: string
+  placeholder?: string
+}) {
+  const [focused, setFocused] = useState(false)
+  const [draftText, setDraftText] = useState("")
+  const displayValue = focused ? draftText : formatNumberForDisplay(value)
+  return (
+    <input
+      type="text"
+      inputMode="decimal"
+      value={displayValue}
+      placeholder={placeholder}
+      onFocus={() => {
+        setFocused(true)
+        setDraftText(value === "" || value == null ? "" : String(value))
+      }}
+      onBlur={() => setFocused(false)}
+      onChange={(e) => {
+        const cleaned = e.target.value.replace(/[^0-9.-]/g, "")
+        setDraftText(cleaned)
+        onChange(cleaned)
+      }}
+      className={className}
+    />
   )
 }
 
@@ -363,7 +415,7 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
   const [columnLabels, setColumnLabels] = useState<ColumnLabels>(() => project.columnLabels)
   const [projectMetaDirty, setProjectMetaDirty] = useState(false)
 
-  const colsPerVendor = 6 + customColumns.length
+  const colsPerVendor = BUILTIN_COL_KEYS.length + customColumns.length
 
   // Shared fixed-width layout — same numbers drive the header's <colgroup> and
   // every vendor's item <table>, which is what keeps them aligned (see COL_WIDTH).
@@ -378,15 +430,25 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
     [rowList]
   )
 
-  // Our own calculation of every vendor's subtotal, charges, GST and grand total.
-  const breakdowns = useMemo(() => {
-    const m = new Map<number, ChargeBreakdown>()
+  // Our own calculation of every row's GST, freight, other charges and total, and each vendor's grand total.
+  const resolutions = useMemo(() => {
+    const m = new Map<number, { res: VendorResolution; byKey: Map<string, ResolvedItem> }>()
     for (const v of doneVendors) {
       const dv = draft[v.id]
-      if (dv) m.set(v.id, computeCharges(dv.items, dv.additionalInfo))
+      if (!dv) continue
+      const res = resolveItems(dv.items, dv.additionalInfo)
+      const byKey = new Map<string, ResolvedItem>()
+      dv.items.forEach((it, i) => byKey.set(it.key, res.items[i]))
+      m.set(v.id, { res, byKey })
     }
     return m
   }, [doneVendors, draft])
+  const resolvedOf = (qid: number, key: string) => resolutions.get(qid)?.byKey.get(key)
+
+  // Lump-sum charges (freight etc.) any vendor quoted below their items; each gets its own row.
+  const lumpKeys = (["designingCharges", "freight", "installation"] as const).filter((k) =>
+    [...resolutions.values()].some((r) => r.res.lumpCharges.some((l) => l.key === k)),
+  )
 
   const [hiddenVendors, setHiddenVendors] = useState<Set<number>>(new Set())
   const [hiddenRows, setHiddenRows] = useState<Set<string>>(new Set())
@@ -475,6 +537,24 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
     markDirty(qid)
   }
 
+  // Typing in a row's Total sets what the row comes to *including* its charges and GST, so work back
+  // to the base amount. The row's current GST % / freight / other charges are pinned first so that
+  // spreading lump-sum charges across rows can't pull the total away from what was typed.
+  const updateItemTotal = (qid: number, key: string, typedTotal: number) => {
+    setDraft((prev) => {
+      const vendor = prev[qid]
+      const res = resolveItems(vendor.items, vendor.additionalInfo)
+      const items = vendor.items.map((it, i) => {
+        if (it.key !== key) return it
+        const r = res.items[i]
+        const base = typedTotal / (1 + r.gstPercent / 100) - r.freight - r.otherCharges
+        return { ...it, gstPercent: r.gstPercent, freight: r.freight, otherCharges: r.otherCharges, totalPrice: Math.round(base * 10000) / 10000 }
+      })
+      return { ...prev, [qid]: { ...vendor, items } }
+    })
+    markDirty(qid)
+  }
+
   const setItemCategory = (qid: number, key: string, value: string | null) =>
     updateItemField(qid, key, "matchedCategory", value)
 
@@ -509,7 +589,7 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
       const vendor = prev[qid]
       const items = [
         ...vendor.items,
-        { key: nextKey(), matchedCategory: category, vendorItemName: "New item", spec: null, quantity: 1, mrp: null, unitPrice: 0, discountPercent: null, totalPrice: 0, format: {}, customFields: {} },
+        { key: nextKey(), matchedCategory: category, vendorItemName: "New item", spec: null, quantity: 1, mrp: null, unitPrice: 0, discountPercent: null, totalPrice: 0, gstPercent: null, freight: null, otherCharges: null, format: {}, customFields: {} },
       ]
       return { ...prev, [qid]: { ...vendor, items } }
     })
@@ -689,41 +769,6 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
       {BUILTIN_COL_KEYS.map((k) => <col key={k} style={{ width: COL_WIDTH[k] }} />)}
       {customColumns.map((col) => <col key={col.id} style={{ width: CUSTOM_COL_WIDTH }} />)}
     </colgroup>
-  )
-
-  // A per-vendor row of the totals block: an editable/explanatory note across Spec..Disc and
-  // the calculated amount under the Total column (custom columns, which sit after Total, stay blank).
-  const renderVendorAmountCells = (
-    cellFor: (v: (typeof doneVendors)[number], dv: DraftVendor, b: ChargeBreakdown) => { note: React.ReactNode; amount: React.ReactNode; amountClass?: string },
-  ) =>
-    doneVendors.map((v) => {
-      const dv = draft[v.id]
-      const b = breakdowns.get(v.id)
-      const vHidden = hiddenVendors.has(v.id)
-      const cell = dv && b ? cellFor(v, dv, b) : null
-      return (
-        <td key={v.id} colSpan={colsPerVendor} className={`border-l p-0 align-top ${vHidden ? "opacity-30" : ""}`}>
-          <table style={{ width: vendorBlockWidth, tableLayout: "fixed" }}>
-            {vendorColGroup}
-            <tbody>
-              <tr>
-                <td colSpan={5} className="px-2 py-1 align-top">{cell?.note}</td>
-                <td className={`px-1 py-1 text-right tabular-nums text-xs pr-2 align-top ${cell?.amountClass ?? ""}`}>{cell?.amount}</td>
-                {customColumns.length > 0 && <td colSpan={customColumns.length} />}
-              </tr>
-            </tbody>
-          </table>
-        </td>
-      )
-    })
-
-  const chargeNoteInput = (qid: number, key: ChargeKey | "gst", dv: DraftVendor, placeholder: string) => (
-    <input
-      className="w-full bg-transparent border-0 border-b border-dashed border-transparent hover:border-muted-foreground/40 focus:border-primary focus:outline-none text-xs px-0 py-0.5"
-      value={dv.additionalInfo[key] ?? ""}
-      onChange={(e) => updateAdditionalInfo(qid, key, e.target.value)}
-      placeholder={placeholder}
-    />
   )
 
   return createPortal(
@@ -941,7 +986,7 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
                       const dv = draft[v.id]
                       const vHidden = hiddenVendors.has(v.id)
                       const items = dv.items.filter((it) => it.matchedCategory === row.orig)
-                      const subtotal = items.reduce((sum, it) => sum + (it.totalPrice || 0), 0)
+                      const subtotal = items.reduce((sum, it) => sum + (resolvedOf(v.id, it.key)?.total ?? 0), 0)
 
                       return (
                         <td key={v.id} colSpan={colsPerVendor} className={`border-l p-0 align-top ${vHidden ? "opacity-30" : ""}`}>
@@ -959,10 +1004,13 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
                                   <td><FormatCell qid={v.id} item={it} field="mrp" type="number" value={it.mrp ?? ""} onChange={(v2) => updateItemField(v.id, it.key, "mrp", v2 === "" ? null : Number(v2))} onToggleFormat={toggleItemFormat} /></td>
                                   <td><FormatCell qid={v.id} item={it} field="unitPrice" type="number" value={it.unitPrice} onChange={(v2) => updateItemField(v.id, it.key, "unitPrice", Number(v2))} onToggleFormat={toggleItemFormat} /></td>
                                   <td><FormatCell qid={v.id} item={it} field="discountPercent" type="number" value={it.discountPercent ?? ""} onChange={(v2) => updateItemField(v.id, it.key, "discountPercent", v2 === "" ? null : Number(v2))} onToggleFormat={toggleItemFormat} /></td>
+<td><FormatCell qid={v.id} item={it} field="gstPercent" type="number" value={resolvedOf(v.id, it.key)?.gstPercent ?? ""} hint={resolvedOf(v.id, it.key) ? fmt(resolvedOf(v.id, it.key)!.gstAmount) : undefined} onChange={(v2) => updateItemField(v.id, it.key, "gstPercent", v2 === "" ? null : Number(v2))} onToggleFormat={toggleItemFormat} /></td>
+<td><FormatCell qid={v.id} item={it} field="freight" type="number" value={resolvedOf(v.id, it.key)?.freight ?? ""} onChange={(v2) => updateItemField(v.id, it.key, "freight", v2 === "" ? null : Number(v2))} onToggleFormat={toggleItemFormat} /></td>
+<td><FormatCell qid={v.id} item={it} field="otherCharges" type="number" value={resolvedOf(v.id, it.key)?.otherCharges ?? ""} onChange={(v2) => updateItemField(v.id, it.key, "otherCharges", v2 === "" ? null : Number(v2))} onToggleFormat={toggleItemFormat} /></td>
                                   <td>
                                     <div className="flex items-start">
                                       <div className="flex-1 min-w-0">
-                                        <FormatCell qid={v.id} item={it} field="totalPrice" type="number" value={it.totalPrice} onChange={(v2) => updateItemField(v.id, it.key, "totalPrice", Number(v2))} onToggleFormat={toggleItemFormat} inputClassName="font-medium" />
+                                        <FormatCell qid={v.id} item={it} field="totalPrice" type="number" value={resolvedOf(v.id, it.key)?.total ?? it.totalPrice} onChange={(v2) => updateItemTotal(v.id, it.key, Number(v2))} onToggleFormat={toggleItemFormat} inputClassName="font-medium" />
                                       </div>
                                       <button onClick={() => removeItem(v.id, it.key)} className="opacity-0 group-hover/item:opacity-100 text-muted-foreground hover:text-destructive shrink-0 pr-1 mt-0.5" title="Delete item">
                                         <Trash2 className="w-3 h-3" />
@@ -973,7 +1021,7 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
                                 </tr>
                               ))}
                               <tr>
-                                <td colSpan={5} className="px-1 py-1">
+                                <td colSpan={BUILTIN_COL_KEYS.length - 1} className="px-1 py-1">
                                   <button onClick={() => addItem(v.id, row.orig)} className="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-primary">
                                     <Plus className="w-3 h-3" /> Add item
                                   </button>
@@ -1018,10 +1066,13 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
                               <td><FormatCell qid={v.id} item={it} field="mrp" type="number" value={it.mrp ?? ""} onChange={(v2) => updateItemField(v.id, it.key, "mrp", v2 === "" ? null : Number(v2))} onToggleFormat={toggleItemFormat} /></td>
                               <td><FormatCell qid={v.id} item={it} field="unitPrice" type="number" value={it.unitPrice} onChange={(v2) => updateItemField(v.id, it.key, "unitPrice", Number(v2))} onToggleFormat={toggleItemFormat} /></td>
                               <td><FormatCell qid={v.id} item={it} field="discountPercent" type="number" value={it.discountPercent ?? ""} onChange={(v2) => updateItemField(v.id, it.key, "discountPercent", v2 === "" ? null : Number(v2))} onToggleFormat={toggleItemFormat} /></td>
+<td><FormatCell qid={v.id} item={it} field="gstPercent" type="number" value={resolvedOf(v.id, it.key)?.gstPercent ?? ""} hint={resolvedOf(v.id, it.key) ? fmt(resolvedOf(v.id, it.key)!.gstAmount) : undefined} onChange={(v2) => updateItemField(v.id, it.key, "gstPercent", v2 === "" ? null : Number(v2))} onToggleFormat={toggleItemFormat} /></td>
+<td><FormatCell qid={v.id} item={it} field="freight" type="number" value={resolvedOf(v.id, it.key)?.freight ?? ""} onChange={(v2) => updateItemField(v.id, it.key, "freight", v2 === "" ? null : Number(v2))} onToggleFormat={toggleItemFormat} /></td>
+<td><FormatCell qid={v.id} item={it} field="otherCharges" type="number" value={resolvedOf(v.id, it.key)?.otherCharges ?? ""} onChange={(v2) => updateItemField(v.id, it.key, "otherCharges", v2 === "" ? null : Number(v2))} onToggleFormat={toggleItemFormat} /></td>
                               <td>
                                 <div className="flex items-start">
                                   <div className="flex-1 min-w-0">
-                                    <FormatCell qid={v.id} item={it} field="totalPrice" type="number" value={it.totalPrice} onChange={(v2) => updateItemField(v.id, it.key, "totalPrice", Number(v2))} onToggleFormat={toggleItemFormat} inputClassName="font-medium" />
+                                    <FormatCell qid={v.id} item={it} field="totalPrice" type="number" value={resolvedOf(v.id, it.key)?.total ?? it.totalPrice} onChange={(v2) => updateItemTotal(v.id, it.key, Number(v2))} onToggleFormat={toggleItemFormat} inputClassName="font-medium" />
                                   </div>
                                   <button onClick={() => removeItem(v.id, it.key)} className="opacity-0 group-hover/item:opacity-100 text-muted-foreground hover:text-destructive shrink-0 pr-1 mt-0.5" title="Delete item">
                                     <Trash2 className="w-3 h-3" />
@@ -1032,7 +1083,7 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
                             </tr>
                           ))}
                           <tr>
-                            <td colSpan={6 + customColumns.length} className="px-1 py-1">
+                            <td colSpan={BUILTIN_COL_KEYS.length + customColumns.length} className="px-1 py-1">
                               <button onClick={() => addItem(v.id, null)} className="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-primary">
                                 <Plus className="w-3 h-3" /> Add item
                               </button>
@@ -1044,6 +1095,57 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
                   )
                 })}
               </tr>
+
+              {/* Lump-sum charges the vendor quoted below their items — their own rows, included in the totals.
+                  The amount is editable (it's saved as the vendor's charge text). */}
+              {lumpKeys.map((key: ChargeKey) => (
+                <tr key={`lump-${key}`} className="border-b bg-muted/5">
+                  <td className="sticky left-0 bg-background z-10 border-r px-3 py-2 text-xs font-medium text-muted-foreground">{CHARGE_LABELS[key]}</td>
+                  {doneVendors.map((v) => {
+                    const r = resolutions.get(v.id)
+                    const lump = r?.res.lumpCharges.find((l) => l.key === key)
+                    const itemised = (r?.res.charges.lines.find((l) => l.key === key)?.itemisedAmount ?? 0) > 0
+                    const vHidden = hiddenVendors.has(v.id)
+                    const amountInput = (
+                      <PlainNumberInput
+                        value={lump?.status === "amount" ? lump.amount : ""}
+                        placeholder="-"
+                        onChange={(raw) => updateAdditionalInfo(v.id, key, raw)}
+                        className={numCell}
+                      />
+                    )
+                    return (
+                      <td key={v.id} colSpan={colsPerVendor} className={`border-l p-0 align-top ${vHidden ? "opacity-30" : ""}`}>
+                        <table style={{ width: vendorBlockWidth, tableLayout: "fixed" }}>
+                          {vendorColGroup}
+                          <tbody>
+                            <tr>
+                              <td colSpan={5} className="px-2 py-1.5 align-top text-[10px] text-muted-foreground">
+                                {itemised
+                                  ? "Already listed as an item above — not added again"
+                                  : lump?.basis
+                                    ? <>
+                                        {`As quoted: ${lump.basis}`}
+                                        {lump.status === "included" && " — no separate charge"}
+                                        {lump.status === "unclear" && <span className="text-amber-600"> — no lump amount stated, nothing added (type one in if there is)</span>}
+                                      </>
+                                    : "Not quoted separately"}
+                              </td>
+                              <td className="px-1 py-1.5 text-right tabular-nums text-xs align-top">
+                                {lump?.status === "amount" ? <>{lump.gstPercent}%<div className="text-[9px] text-muted-foreground">{fmt(lump.gstAmount)}</div></> : ""}
+                              </td>
+                              <td className="px-1 py-1 align-top">{key === "freight" && !itemised ? amountInput : null}</td>
+                              <td className="px-1 py-1 align-top">{key !== "freight" && !itemised ? amountInput : null}</td>
+                              <td className="px-1 py-1.5 text-right tabular-nums text-xs font-medium pr-2 align-top">{lump?.status === "amount" ? fmt(lump.total) : "-"}</td>
+                              {customColumns.length > 0 && <td colSpan={customColumns.length} />}
+                            </tr>
+                          </tbody>
+                        </table>
+                      </td>
+                    )
+                  })}
+                </tr>
+              ))}
 
               {/* Terms rows (lead time, payment, warranty…) — plain text */}
               <tr><td colSpan={1 + doneVendors.length * colsPerVendor} className="h-3 p-0"></td></tr>
@@ -1069,77 +1171,37 @@ export function ExportPreviewModal({ open, onClose, comparison, project, project
                 </tr>
               ))}
 
-              {/* Charges & totals — calculated here from the line items and the charges the vendor
-                  quoted, not copied from the vendor's own total (which may contain mistakes). */}
-              <tr><td colSpan={1 + doneVendors.length * colsPerVendor} className="h-3 p-0"></td></tr>
-              <tr className="bg-muted/10 border-t">
-                <td className="sticky left-0 bg-muted/10 z-10 border-r px-3 py-1.5 text-xs font-semibold">Items Subtotal</td>
-                {renderVendorAmountCells((_v, _dv, b) => ({ note: null, amount: fmt(b.itemsSubtotal), amountClass: "font-semibold" }))}
-              </tr>
-              {CHARGE_KEYS.map((key) => (
-                <tr key={key} className="text-xs">
-                  <td className="sticky left-0 bg-background z-10 border-r px-3 py-1.5 font-medium text-muted-foreground">{CHARGE_LABELS[key]}</td>
-                  {renderVendorAmountCells((v, dv, b) => {
-                    const line = b.lines.find((l) => l.key === key)!
-                    const hint =
-                      line.itemisedAmount > 0 ? `Already listed as an item above (${fmt(line.itemisedAmount)}) — not added again`
-                      : line.waived ? "No charge"
-                      : line.basis && /%/.test(line.basis) ? `${fmt(line.amount)} calculated on the items subtotal`
-                      : null
-                    return {
-                      note: (
-                        <>
-                          {chargeNoteInput(v.id, key, dv, "e.g. ₹2,000 or 2%")}
-                          {hint && <div className="text-[10px] text-muted-foreground mt-0.5">{hint}</div>}
-                        </>
-                      ),
-                      amount: line.itemisedAmount > 0 || (!line.basis) ? "-" : fmt(line.amount),
-                    }
-                  })}
-                </tr>
-              ))}
-              <tr className="bg-muted/10 border-t">
-                <td className="sticky left-0 bg-muted/10 z-10 border-r px-3 py-1.5 text-xs font-semibold">Total before GST</td>
-                {renderVendorAmountCells((_v, _dv, b) => ({ note: null, amount: fmt(b.taxableValue), amountClass: "font-semibold" }))}
-              </tr>
-              <tr className="text-xs">
-                <td className="sticky left-0 bg-background z-10 border-r px-3 py-1.5 font-medium text-muted-foreground">GST</td>
-                {renderVendorAmountCells((v, dv, b) => {
-                  const { gst } = b
-                  const hint =
-                    gst.included ? { text: "Already included in the prices above — nothing added", warn: false }
-                    : gst.rate != null ? { text: `${gst.rate}% of ${fmt(b.taxableValue)} (calculated)`, warn: false }
-                    : gst.basis ? { text: "Amount as stated by the vendor — rate unknown, can't be verified", warn: true }
-                    : { text: "GST not stated — NOT included in the total below", warn: true }
-                  return {
-                    note: (
-                      <>
-                        {chargeNoteInput(v.id, "gst", dv, "e.g. 18%")}
-                        <div className={`text-[10px] mt-0.5 ${hint.warn ? "text-amber-600" : "text-muted-foreground"}`}>{hint.text}</div>
-                      </>
-                    ),
-                    amount: gst.basis || gst.amount ? fmt(gst.amount) : "-",
-                  }
-                })}
-              </tr>
-
-              {/* Grand total — always calculated, with a cross-check against the vendor's own figure */}
+              {/* Grand total — always calculated (sum of every row's Total, which includes its charges and GST),
+                  with a cross-check against the vendor's own figure */}
               <tr className="font-bold bg-[#1F4E79] text-white border-t-2">
                 <td className="sticky left-0 bg-[#1F4E79] z-10 border-r px-3 py-2.5 text-sm">
                   GRAND TOTAL <span className="block text-[10px] font-normal opacity-80">(incl. GST)</span>
                 </td>
                 {doneVendors.map((v) => {
                   const dv = draft[v.id]
-                  const b = breakdowns.get(v.id)
+                  const r = resolutions.get(v.id)
                   const vHidden = hiddenVendors.has(v.id)
                   const quoted = dv?.grandTotal ?? null
-                  const diff = b && quoted != null ? b.grandTotal - quoted : null
+                  const diff = r && quoted != null ? r.res.grandTotal - quoted : null
                   return (
                     <td key={v.id} colSpan={colsPerVendor} className={`border-l px-3 py-2 ${vHidden ? "opacity-30" : ""}`}>
-                      <div className="text-right tabular-nums text-base">{b ? fmt(b.grandTotal) : "-"}</div>
+                      <div className="text-right tabular-nums text-base">{r ? fmt(r.res.grandTotal) : "-"}</div>
+                      {r && (
+                        <div className="text-right text-[10px] font-normal opacity-90">
+                          Items {fmt(r.res.baseTotal)}
+                          {r.res.freightTotal > 0 && ` + Freight ${fmt(r.res.freightTotal)}`}
+                          {r.res.otherTotal > 0 && ` + Other ${fmt(r.res.otherTotal)}`}
+                          {` + GST ${fmt(r.res.gstTotal)}`}
+                        </div>
+                      )}
+                      {r?.res.charges.gst.assumed && (
+                        <div className="text-right text-[10px] font-normal text-amber-300">
+                          Vendor didn't state GST — standard {r.res.charges.gst.rate}% assumed (change it in the GST % column)
+                        </div>
+                      )}
                       {diff != null && (
-                        <div className={`text-right text-[10px] font-normal mt-0.5 ${Math.abs(diff) < 1 ? "text-emerald-300" : "text-amber-300"}`}>
-                          {Math.abs(diff) < 1
+                        <div className={`text-right text-[10px] font-normal ${Math.abs(diff) <= TOTAL_TOLERANCE ? "text-emerald-300" : "text-amber-300"}`}>
+                          {Math.abs(diff) <= TOTAL_TOLERANCE
                             ? `✓ Matches the vendor's quoted total (${fmt(quoted)})`
                             : `⚠ Vendor quoted ${fmt(quoted)} — our calculation is ${fmt(Math.abs(diff))} ${diff < 0 ? "lower" : "higher"}`}
                         </div>

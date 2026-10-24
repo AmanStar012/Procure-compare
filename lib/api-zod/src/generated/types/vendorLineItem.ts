@@ -23,6 +23,21 @@ export interface VendorLineItem {
   /** @nullable */
   discountPercent?: number | null;
   totalPrice: number;
+  /**
+     * GST rate (%) for this line. Null means use the vendor's stated rate (or 18% if none was stated).
+     * @nullable
+     */
+  gstPercent?: number | null;
+  /**
+     * Freight/cartage charge for this line. Null means use this line's share of any lump-sum freight the vendor quoted.
+     * @nullable
+     */
+  freight?: number | null;
+  /**
+     * Installation/designing/other charge for this line. Null means use this line's share of any lump-sum charges the vendor quoted.
+     * @nullable
+     */
+  otherCharges?: number | null;
   format?: ItemFormatMap;
   customFields?: VendorLineItemCustomFields;
 }

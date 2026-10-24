@@ -15,5 +15,8 @@ export interface ColumnLabels {
   mrp?: string;
   unitPrice?: string;
   discountPercent?: string;
+  gstPercent?: string;
+  freight?: string;
+  otherCharges?: string;
   totalPrice?: string;
 }

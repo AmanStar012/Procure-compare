@@ -258,6 +258,9 @@ router.patch("/projects/:id/quotations/:qid", async (req, res) => {
             unitPrice: item.unitPrice,
             discountPercent: item.discountPercent ?? null,
             totalPrice: item.totalPrice,
+            gstPercent: item.gstPercent ?? null,
+            freight: item.freight ?? null,
+            otherCharges: item.otherCharges ?? null,
             ...(item.format ? { format: item.format } : {}),
             ...(item.customFields ? { customFields: item.customFields } : {}),
           }))

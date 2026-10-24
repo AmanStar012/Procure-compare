@@ -290,6 +290,12 @@ components:
           type: string
         discountPercent:
           type: string
+        gstPercent:
+          type: string
+        freight:
+          type: string
+        otherCharges:
+          type: string
         totalPrice:
           type: string
 
@@ -452,6 +458,15 @@ components:
           type: ["number", "null"]
         totalPrice:
           type: number
+        gstPercent:
+          type: ["number", "null"]
+          description: GST rate (%) for this line. Null means use the vendor's stated rate (or 18% if none was stated).
+        freight:
+          type: ["number", "null"]
+          description: Freight/cartage charge for this line. Null means use this line's share of any lump-sum freight the vendor quoted.
+        otherCharges:
+          type: ["number", "null"]
+          description: Installation/designing/other charge for this line. Null means use this line's share of any lump-sum charges the vendor quoted.
         format:
           $ref: "#/components/schemas/ItemFormatMap"
         customFields:
@@ -516,6 +531,15 @@ components:
           type: ["number", "null"]
         totalPrice:
           type: number
+        gstPercent:
+          type: ["number", "null"]
+          description: GST rate (%) for this line. Null means use the vendor's stated rate (or 18% if none was stated).
+        freight:
+          type: ["number", "null"]
+          description: Freight/cartage charge for this line. Null means use this line's share of any lump-sum freight the vendor quoted.
+        otherCharges:
+          type: ["number", "null"]
+          description: Installation/designing/other charge for this line. Null means use this line's share of any lump-sum charges the vendor quoted.
         format:
           $ref: "#/components/schemas/ItemFormatMap"
         customFields:
@@ -593,6 +617,15 @@ components:
           type: ["number", "null"]
         totalPrice:
           type: number
+        gstPercent:
+          type: ["number", "null"]
+          description: GST rate (%) for this line. Null means use the vendor's stated rate (or 18% if none was stated).
+        freight:
+          type: ["number", "null"]
+          description: Freight/cartage charge for this line. Null means use this line's share of any lump-sum freight the vendor quoted.
+        otherCharges:
+          type: ["number", "null"]
+          description: Installation/designing/other charge for this line. Null means use this line's share of any lump-sum charges the vendor quoted.
         format:
           $ref: "#/components/schemas/ItemFormatMap"
         customFields:

@@ -4,7 +4,7 @@ import { quotationsTable, projectsTable } from "@workspace/db";
 import { eq } from "drizzle-orm";
 import { buildComparison, type VendorLineItem, type OtherItem } from "../lib/build-comparison.js";
 import type { ParsedQuotation, ItemFormat, ItemFormatMap } from "../lib/parse-quotation.js";
-import { computeCharges, CHARGE_LABELS, type ChargeBreakdown } from "../lib/charges.js";
+import { resolveItems, resolveVendorInComparison, CHARGE_LABELS, TOTAL_TOLERANCE, type ResolvedItem, type VendorComparisonResolution } from "../lib/charges.js";
 import ExcelJS from "exceljs";
 
 const router = Router();
@@ -65,7 +65,7 @@ router.get("/projects/:id/summary", async (req, res) => {
           // Rank vendors on our own calculation (items + charges + GST), not the total
           // printed on their document, which may contain arithmetic mistakes.
           const total = parsed.items.length > 0
-            ? computeCharges(parsed.items, parsed.additionalInfo).grandTotal
+            ? resolveItems(parsed.items, parsed.additionalInfo).grandTotal
             : parsed.grandTotal;
           return { vendorName: q.vendorName, total };
         } catch {
@@ -118,16 +118,22 @@ router.get("/projects/:id/export", async (req, res) => {
 
     const customColumns = JSON.parse(project.customColumns) as { id: string; label: string }[];
     const columnLabels = JSON.parse(project.columnLabels) as Partial<Record<
-      "spec" | "qty" | "mrp" | "unitPrice" | "discountPercent" | "totalPrice",
+      "spec" | "qty" | "mrp" | "unitPrice" | "discountPercent" | "gstPercent" | "freight" | "otherCharges" | "totalPrice",
       string
     >>;
-    const defaultLabels = { spec: "Spec", qty: "Qty", mrp: "MRP", unitPrice: "Unit Price", discountPercent: "Disc %", totalPrice: "Total Amount" };
+    const defaultLabels = {
+      spec: "Spec", qty: "Qty", mrp: "MRP", unitPrice: "Unit Price", discountPercent: "Disc %",
+      gstPercent: "GST %", freight: "Freight", otherCharges: "Other Charges", totalPrice: "Total (incl. GST)",
+    };
     const subHeaderLabels = [
       columnLabels.spec || defaultLabels.spec,
       columnLabels.qty || defaultLabels.qty,
       columnLabels.mrp || defaultLabels.mrp,
       columnLabels.unitPrice || defaultLabels.unitPrice,
       columnLabels.discountPercent || defaultLabels.discountPercent,
+      columnLabels.gstPercent || defaultLabels.gstPercent,
+      columnLabels.freight || defaultLabels.freight,
+      columnLabels.otherCharges || defaultLabels.otherCharges,
       columnLabels.totalPrice || defaultLabels.totalPrice,
       ...customColumns.map((c) => c.label),
     ];
@@ -144,6 +150,14 @@ router.get("/projects/:id/export", async (req, res) => {
 
     const doneVendors = result.vendors
       .filter((v) => v.status === "done" && !excludeVendorIds.has(v.id));
+
+    // Our own calculation of every row's GST, freight, other charges and total (a value the user
+    // typed on a row wins; otherwise it defaults from what the vendor quoted). Resolved on the full
+    // row list, before any rows are excluded, because the results are indexed by row position.
+    const resolutions = new Map<number, VendorComparisonResolution>();
+    for (const v of doneVendors) resolutions.set(v.id, resolveVendorInComparison(result, v.id));
+    const rowIndexByCategory = new Map(result.rows.map((r, i) => [r.category, i]));
+
     const filteredRows = excludeRowKeys.size
       ? result.rows.filter((r) => !excludeRowKeys.has(r.category))
       : result.rows;
@@ -154,18 +168,21 @@ router.get("/projects/:id/export", async (req, res) => {
 
     // ── Column layout ────────────────────────────────────────────────
     // Col 1: Category (A)
-    // Per vendor: Spec | Qty | MRP | Unit Price | Disc % | Total | [custom columns...] | [gap]
+    // Per vendor: Spec | Qty | MRP | Unit Price | Disc % | GST % | Freight | Other | Total | [custom columns...] | [gap]
     const CAT_COL = 1;
-    const NUM_DATA_COLS = 6 + customColumns.length;
+    const NUM_DATA_COLS = 9 + customColumns.length;
     const VENDOR_STRIDE = NUM_DATA_COLS + 1;
     const vendorStartCol = (vi: number) => 2 + vi * VENDOR_STRIDE; // 1-based Spec col
-    const specCol  = (vi: number) => vendorStartCol(vi);
-    const qtyCol   = (vi: number) => vendorStartCol(vi) + 1;
-    const mrpCol   = (vi: number) => vendorStartCol(vi) + 2;
-    const unitCol  = (vi: number) => vendorStartCol(vi) + 3;
-    const discCol  = (vi: number) => vendorStartCol(vi) + 4;
-    const totalCol = (vi: number) => vendorStartCol(vi) + 5;
-    const customCol = (vi: number, ci: number) => vendorStartCol(vi) + 6 + ci;
+    const specCol    = (vi: number) => vendorStartCol(vi);
+    const qtyCol     = (vi: number) => vendorStartCol(vi) + 1;
+    const mrpCol     = (vi: number) => vendorStartCol(vi) + 2;
+    const unitCol    = (vi: number) => vendorStartCol(vi) + 3;
+    const discCol    = (vi: number) => vendorStartCol(vi) + 4;
+    const gstCol     = (vi: number) => vendorStartCol(vi) + 5;
+    const freightCol = (vi: number) => vendorStartCol(vi) + 6;
+    const otherCol   = (vi: number) => vendorStartCol(vi) + 7;
+    const totalCol   = (vi: number) => vendorStartCol(vi) + 8;
+    const customCol  = (vi: number, ci: number) => vendorStartCol(vi) + 9 + ci;
 
     const workbook = new ExcelJS.Workbook();
     const ws = workbook.addWorksheet("Comparison");
@@ -175,13 +192,17 @@ router.get("/projects/:id/export", async (req, res) => {
     const MID_BLUE    = "FF2E75B6";
     const GREEN_FILL  = "FFE2EFDA";
     const GRAY_FILL   = "FFF2F2F2";
+    const AMBER_FILL  = "FFFFE699";
     const HIGHLIGHT_FILL = "FFFFF59D";
     const WHITE       = "FFFFFFFF";
+    const MONEY_FMT   = '₹#,##0.00';
 
     const boldWhite  = { bold: true, color: { argb: WHITE } };
     const boldBlack  = { bold: true };
     const thinBorder = { style: "thin" as const, color: { argb: "FFB0B0B0" } };
     const allBorders = { top: thinBorder, left: thinBorder, bottom: thinBorder, right: thinBorder };
+
+    const rupees = (n: number) => "₹" + new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2 }).format(n);
 
     // Applies bold/italic/underline/highlight for a single cell from a line item's saved
     // per-column format, on top of whatever font/fill styling the cell already has.
@@ -201,13 +222,27 @@ router.get("/projects/:id/export", async (req, res) => {
       }
     };
 
-    // Applies each of the 6 standard cells' own format from the item's per-column map —
+    type RowCells = {
+      sCell: ExcelJS.Cell; qCell: ExcelJS.Cell; mCell: ExcelJS.Cell; uCell: ExcelJS.Cell; dCell: ExcelJS.Cell
+      gCell: ExcelJS.Cell; fCell: ExcelJS.Cell; oCell: ExcelJS.Cell; tCell: ExcelJS.Cell
+    };
+
+    // Gets the standard cells of a row for one vendor.
+    const cellsFor = (row: ExcelJS.Row, vi: number): RowCells => ({
+      sCell: row.getCell(specCol(vi)),
+      qCell: row.getCell(qtyCol(vi)),
+      mCell: row.getCell(mrpCol(vi)),
+      uCell: row.getCell(unitCol(vi)),
+      dCell: row.getCell(discCol(vi)),
+      gCell: row.getCell(gstCol(vi)),
+      fCell: row.getCell(freightCol(vi)),
+      oCell: row.getCell(otherCol(vi)),
+      tCell: row.getCell(totalCol(vi)),
+    });
+
+    // Applies each standard cell's own format from the item's per-column map —
     // e.g. bolding just the Total cell no longer bolds Qty/Rate/etc on the same row.
-    const applyRowFormat = (
-      cells: { sCell: ExcelJS.Cell; qCell: ExcelJS.Cell; mCell: ExcelJS.Cell; uCell: ExcelJS.Cell; dCell: ExcelJS.Cell; tCell: ExcelJS.Cell },
-      formatMap: ItemFormatMap | undefined,
-      nameFormat?: ItemFormat,
-    ) => {
+    const applyRowFormat = (cells: RowCells, formatMap: ItemFormatMap | undefined, nameFormat?: ItemFormat) => {
       if (!formatMap && !nameFormat) return;
       // The Spec column also displays the item name (they share one Excel cell), so merge both.
       applyItemFormat(cells.sCell, nameFormat);
@@ -217,6 +252,27 @@ router.get("/projects/:id/export", async (req, res) => {
       applyItemFormat(cells.uCell, formatMap?.unitPrice);
       applyItemFormat(cells.dCell, formatMap?.discountPercent);
       applyItemFormat(cells.tCell, formatMap?.totalPrice);
+    };
+
+    // Number formats and alignment shared by every item-like row.
+    const styleItemCells = (cells: RowCells) => {
+      cells.sCell.alignment = { horizontal: "left", vertical: "middle" };
+      cells.sCell.border = allBorders;
+      for (const c of [cells.qCell, cells.mCell, cells.uCell, cells.dCell, cells.gCell, cells.fCell, cells.oCell, cells.tCell]) {
+        c.alignment = { horizontal: "right", vertical: "middle" };
+        c.border = allBorders;
+      }
+      for (const c of [cells.mCell, cells.uCell]) if (typeof c.value === "number") c.numFmt = '₹#,##0';
+      for (const c of [cells.fCell, cells.oCell, cells.tCell]) if (typeof c.value === "number") c.numFmt = MONEY_FMT;
+      if (typeof cells.gCell.value === "number") cells.gCell.numFmt = '0.##"%"';
+    };
+
+    // Writes the GST % / Freight / Other Charges / Total cells from resolved values.
+    const writeChargeCells = (cells: RowCells, r: { gstPercent: number | null; freight: number; otherCharges: number; total: number }) => {
+      cells.gCell.value = r.gstPercent ?? "";
+      cells.fCell.value = r.freight > 0 ? r.freight : "-";
+      cells.oCell.value = r.otherCharges > 0 ? r.otherCharges : "-";
+      cells.tCell.value = r.total;
     };
 
     // ── Row 1: Vendor names ──────────────────────────────────────────
@@ -253,7 +309,7 @@ router.get("/projects/:id/export", async (req, res) => {
         cell.value = lbl;
         cell.font  = { bold: true, color: { argb: WHITE }, size: 9 };
         cell.fill  = { type: "pattern", pattern: "solid", fgColor: { argb: MID_BLUE } };
-        cell.alignment = { horizontal: offset === 0 ? "left" : "right", vertical: "middle" };
+        cell.alignment = { horizontal: offset === 0 ? "left" : "right", vertical: "middle", wrapText: true };
         cell.border = allBorders;
       });
     });
@@ -268,10 +324,16 @@ router.get("/projects/:id/export", async (req, res) => {
       });
     };
 
+    const sum = (items: ResolvedItem[], pick: (r: ResolvedItem) => number) =>
+      Math.round(items.reduce((a, r) => a + pick(r), 0) * 100) / 100;
+    const uniformValue = <T,>(values: T[]): T | null =>
+      values.length > 0 && values.every((v) => v === values[0]) ? values[0] : null;
+
     // ── Item rows, one per category ────────────────────────────────────
     for (const row of result.rows) {
       const excelRow = ws.addRow([]);
       excelRow.height = 16;
+      const origRowIdx = rowIndexByCategory.get(row.category) ?? -1;
 
       const catCell = excelRow.getCell(CAT_COL);
       catCell.value = row.category;
@@ -279,25 +341,25 @@ router.get("/projects/:id/export", async (req, res) => {
       catCell.fill  = { type: "pattern", pattern: "solid", fgColor: { argb: GRAY_FILL } };
       catCell.border = allBorders;
 
-      // Find lowest total for green highlight
-      const prices = row.vendors
-        .filter((v) => v.available && v.totalPrice != null)
-        .map((v) => v.totalPrice!);
+      // All-in (incl. charges and GST) total per vendor for this category; the lowest gets the green highlight
+      const resolvedFor = (vendorId: number): ResolvedItem[] => resolutions.get(vendorId)?.rowItems[origRowIdx] ?? [];
+      const totalByVendor = new Map<number, number>();
+      for (const v of row.vendors) {
+        const r = resolvedFor(v.quotationId);
+        if (v.available && r.length > 0) totalByVendor.set(v.quotationId, sum(r, (x) => x.total));
+      }
+      const prices = [...totalByVendor.values()];
       const minPrice = prices.length ? Math.min(...prices) : null;
 
       doneVendors.forEach((vendor, vi) => {
         const vr  = row.vendors.find((v) => v.quotationId === vendor.id);
-        const sc  = vendorStartCol(vi);
-        const isLowest = vr?.available && vr.totalPrice != null && vr.totalPrice === minPrice;
+        const resolved = resolvedFor(vendor.id);
+        const isLowest = vr?.available && totalByVendor.get(vendor.id) === minPrice && minPrice != null;
         // Format only carries over unambiguously when exactly one line item makes up this row.
         const soleItem: VendorLineItem | undefined = vr?.lineItems.length === 1 ? vr.lineItems[0] : undefined;
 
-        const sCell = excelRow.getCell(sc);
-        const qCell = excelRow.getCell(sc + 1);
-        const mCell = excelRow.getCell(sc + 2);
-        const uCell = excelRow.getCell(sc + 3);
-        const dCell = excelRow.getCell(sc + 4);
-        const tCell = excelRow.getCell(sc + 5);
+        const cells = cellsFor(excelRow, vi);
+        const { sCell, qCell, mCell, uCell, dCell, tCell } = cells;
 
         if (vr?.available) {
           sCell.value = vr.vendorItemName
@@ -307,18 +369,15 @@ router.get("/projects/:id/export", async (req, res) => {
           mCell.value = vr.mrp ?? "";
           uCell.value = vr.unitPrice ?? "";
           dCell.value = vr.discountPercent != null ? `${vr.discountPercent}%` : "";
-          tCell.value = vr.totalPrice ?? "";
+          writeChargeCells(cells, {
+            gstPercent: uniformValue(resolved.map((r) => r.gstPercent)),
+            freight: sum(resolved, (r) => r.freight),
+            otherCharges: sum(resolved, (r) => r.otherCharges),
+            total: sum(resolved, (r) => r.total),
+          });
         }
 
-        sCell.alignment = { horizontal: "left", vertical: "middle" };
-        sCell.border = allBorders;
-        [qCell, mCell, uCell, dCell, tCell].forEach((c) => {
-          c.alignment = { horizontal: "right", vertical: "middle" };
-          c.border = allBorders;
-          if (typeof c.value === "number" && (c === mCell || c === uCell || c === tCell)) {
-            c.numFmt = '₹#,##0';
-          }
-        });
+        styleItemCells(cells);
 
         if (isLowest) {
           tCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: GREEN_FILL } };
@@ -326,7 +385,7 @@ router.get("/projects/:id/export", async (req, res) => {
         }
 
         if (soleItem) {
-          applyRowFormat({ sCell, qCell, mCell, uCell, dCell, tCell }, soleItem.format);
+          applyRowFormat(cells, soleItem.format);
         }
         writeCustomFields(excelRow, vi, soleItem?.customFields, soleItem?.format);
       });
@@ -345,13 +404,9 @@ router.get("/projects/:id/export", async (req, res) => {
           doneVendors.forEach((vendor, vi) => {
             const vr = row.vendors.find((v) => v.quotationId === vendor.id);
             const item = vr?.lineItems[li];
-            const sc = vendorStartCol(vi);
-            const sCell = variantRow.getCell(sc);
-            const qCell = variantRow.getCell(sc + 1);
-            const mCell = variantRow.getCell(sc + 2);
-            const uCell = variantRow.getCell(sc + 3);
-            const dCell = variantRow.getCell(sc + 4);
-            const tCell = variantRow.getCell(sc + 5);
+            const itemResolved = resolvedFor(vendor.id)[li];
+            const cells = cellsFor(variantRow, vi);
+            const { sCell, qCell, mCell, uCell, dCell } = cells;
 
             if (item) {
               sCell.value = `${item.vendorItemName}${item.spec ? " — " + item.spec : ""}`;
@@ -359,23 +414,16 @@ router.get("/projects/:id/export", async (req, res) => {
               mCell.value = item.mrp ?? "";
               uCell.value = item.unitPrice;
               dCell.value = item.discountPercent != null ? `${item.discountPercent}%` : "";
-              tCell.value = item.totalPrice;
+              if (itemResolved) writeChargeCells(cells, itemResolved);
             }
 
-            [sCell, qCell, mCell, uCell, dCell, tCell].forEach((c) => {
+            styleItemCells(cells);
+            for (const c of [sCell, qCell, mCell, uCell, dCell, cells.gCell, cells.fCell, cells.oCell, cells.tCell]) {
               c.font = { italic: true, size: 8, color: { argb: "FF666666" } };
-              c.border = allBorders;
-              if (typeof c.value === "number" && (c === mCell || c === uCell || c === tCell)) {
-                c.numFmt = '₹#,##0';
-              }
-            });
-            sCell.alignment = { horizontal: "left", vertical: "middle" };
-            [qCell, mCell, uCell, dCell, tCell].forEach((c) => {
-              c.alignment = { horizontal: "right", vertical: "middle" };
-            });
+            }
 
             if (item) {
-              applyRowFormat({ sCell, qCell, mCell, uCell, dCell, tCell }, item.format, item.format?.vendorItemName);
+              applyRowFormat(cells, item.format, item.format?.vendorItemName);
             }
             writeCustomFields(variantRow, vi, item?.customFields, item?.format);
           });
@@ -411,13 +459,9 @@ router.get("/projects/:id/export", async (req, res) => {
 
         doneVendors.forEach((vendor, vi) => {
           const item = (otherByVendor.get(vendor.id) ?? [])[oi];
-          const sc = vendorStartCol(vi);
-          const sCell = itemRow.getCell(sc);
-          const qCell = itemRow.getCell(sc + 1);
-          const mCell = itemRow.getCell(sc + 2);
-          const uCell = itemRow.getCell(sc + 3);
-          const dCell = itemRow.getCell(sc + 4);
-          const tCell = itemRow.getCell(sc + 5);
+          const itemResolved = resolutions.get(vendor.id)?.otherResolved[oi];
+          const cells = cellsFor(itemRow, vi);
+          const { sCell, qCell, mCell, uCell, dCell } = cells;
 
           if (item) {
             sCell.value = `${item.vendorItemName}${item.spec ? " — " + item.spec : ""}`;
@@ -425,36 +469,71 @@ router.get("/projects/:id/export", async (req, res) => {
             mCell.value = item.mrp ?? "";
             uCell.value = item.unitPrice;
             dCell.value = item.discountPercent != null ? `${item.discountPercent}%` : "";
-            tCell.value = item.totalPrice;
+            if (itemResolved) writeChargeCells(cells, itemResolved);
           }
 
-          [sCell, qCell, mCell, uCell, dCell, tCell].forEach((c) => {
+          styleItemCells(cells);
+          for (const c of [sCell, qCell, mCell, uCell, dCell, cells.gCell, cells.fCell, cells.oCell, cells.tCell]) {
             c.font = { italic: true, size: 8, color: { argb: "FF666666" } };
-            c.border = allBorders;
-            if (typeof c.value === "number" && (c === mCell || c === uCell || c === tCell)) {
-              c.numFmt = '₹#,##0';
-            }
-          });
-          sCell.alignment = { horizontal: "left", vertical: "middle" };
-          [qCell, mCell, uCell, dCell, tCell].forEach((c) => {
-            c.alignment = { horizontal: "right", vertical: "middle" };
-          });
+          }
 
           if (item) {
-            applyRowFormat({ sCell, qCell, mCell, uCell, dCell, tCell }, item.format, item.format?.vendorItemName);
+            applyRowFormat(cells, item.format, item.format?.vendorItemName);
           }
           writeCustomFields(itemRow, vi, item?.customFields, item?.format);
         });
       }
     }
 
+    // ── Lump-sum charges quoted below the items (designing, freight, installation) ──
+    // Shown as their own rows (not spread across the item rows), taxed at the vendor's GST rate.
+    const lumpKeys = (["designingCharges", "freight", "installation"] as const).filter((k) =>
+      doneVendors.some((v) => resolutions.get(v.id)?.lumpCharges.some((l) => l.key === k)));
+    if (lumpKeys.length > 0) {
+      ws.addRow([]).height = 4;
+      for (const key of lumpKeys) {
+        const lumpRow = ws.addRow([]);
+        lumpRow.height = 16;
+        const lc = lumpRow.getCell(CAT_COL);
+        lc.value = CHARGE_LABELS[key];
+        lc.font = { bold: true, italic: true };
+        lc.fill = { type: "pattern", pattern: "solid", fgColor: { argb: GRAY_FILL } };
+        lc.border = allBorders;
+
+        let longestNote = 0;
+        doneVendors.forEach((vendor, vi) => {
+          const lump = resolutions.get(vendor.id)?.lumpCharges.find((l) => l.key === key);
+          const cells = cellsFor(lumpRow, vi);
+          if (lump) {
+            const suffix = lump.status === "included" ? " — no separate charge" : lump.status === "unclear" ? " — no lump amount stated, nothing added" : "";
+            const note = (lump.basis ? "As quoted: " + lump.basis : "") + suffix;
+            cells.sCell.value = note;
+            longestNote = Math.max(longestNote, note.length);
+            if (lump.status === "amount") {
+              cells.gCell.value = lump.gstPercent;
+              (key === "freight" ? cells.fCell : cells.oCell).value = lump.amount;
+              cells.tCell.value = lump.total;
+            }
+          }
+          styleItemCells(cells);
+          cells.sCell.font = { italic: true, size: 8, color: { argb: "FF666666" } };
+          cells.sCell.alignment = { horizontal: "left", vertical: "middle", wrapText: true };
+          // the note spans Spec..Disc %
+          ws.mergeCells(lumpRow.number, specCol(vi), lumpRow.number, discCol(vi));
+          writeCustomFields(lumpRow, vi, undefined, undefined);
+        });
+        // the note spans about 45 characters per line (Spec..Disc %) — grow the row to fit it
+        lumpRow.height = Math.max(16, Math.ceil(longestNote / 45) * 11 + 5);
+      }
+    }
+
     // ── Terms rows (lead time, samples, payment, warranty) ───────────
-    // The monetary ones (designing, freight, installation, GST) are not listed here as
-    // free text — they're calculated and shown as rows in the totals block below.
+    // GST, freight, installation and designing are not listed here as free text — they're
+    // calculated into the GST % / Freight / Other Charges / Total columns above.
     ws.addRow([]).height = 8;
 
-    const CHARGE_LABEL_SET = new Set<string>(Object.values(CHARGE_LABELS));
-    for (const info of result.additionalInfo.filter((i) => !CHARGE_LABEL_SET.has(i.label))) {
+    const CHARGE_LABELS_IN_COLUMNS = new Set(["Designing Charges", "GST", "Installation", "Freight / Cartage"]);
+    for (const info of result.additionalInfo.filter((i) => !CHARGE_LABELS_IN_COLUMNS.has(i.label))) {
       const infoRow = ws.addRow([]);
       infoRow.height = 16;
 
@@ -476,90 +555,10 @@ router.get("/projects/:id/export", async (req, res) => {
       });
     }
 
-    // ── Charges & totals ─────────────────────────────────────────────
-    // Calculated by us from each vendor's line items and quoted charge text rather than
-    // copied from the vendor's own grand total, since vendors make arithmetic mistakes.
-    const MONEY_FMT = '₹#,##0.00';
-    const AMBER_FILL = "FFFFE699";
-    const stated = new Map<number, ParsedQuotation>();
-    const breakdowns = new Map<number, ChargeBreakdown>();
-    for (const v of doneVendors) {
-      if (!v.parsedData) continue;
-      const parsed = JSON.parse(v.parsedData) as ParsedQuotation;
-      stated.set(v.id, parsed);
-      breakdowns.set(v.id, computeCharges(parsed.items, parsed.additionalInfo));
-    }
-    const rupees = (n: number) => "₹" + new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2 }).format(n);
-
+    // ── Grand total ──────────────────────────────────────────────────
+    // Calculated by us (sum of every row's Total, which includes its charges and GST), not copied
+    // from the vendor's own total, since vendors make arithmetic mistakes.
     ws.addRow([]).height = 8;
-
-    // One row: label in col A, descriptive text across Spec..Disc, amount under the Total column.
-    const addAmountRow = (
-      label: string,
-      cellsFor: (b: ChargeBreakdown) => { text: string; amount: number | null },
-      style: { bold?: boolean; fill?: string; fontColor?: string; height?: number } = {},
-    ) => {
-      const row = ws.addRow([]);
-      row.height = style.height ?? 16;
-      const lc = row.getCell(CAT_COL);
-      lc.value = label;
-      lc.font = { bold: true, italic: !style.bold, color: style.fontColor ? { argb: style.fontColor } : undefined };
-      if (style.fill) lc.fill = { type: "pattern", pattern: "solid", fgColor: { argb: style.fill } };
-      lc.border = allBorders;
-
-      let longestText = 0;
-      doneVendors.forEach((v, vi) => {
-        const b = breakdowns.get(v.id);
-        const sc = vendorStartCol(vi);
-        for (let off = 0; off < NUM_DATA_COLS; off++) {
-          const c = row.getCell(sc + off);
-          c.border = allBorders;
-          if (style.fill) c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: style.fill } };
-        }
-        if (!b) return;
-        const { text, amount } = cellsFor(b);
-        longestText = Math.max(longestText, text.length);
-        const tc = row.getCell(sc);
-        tc.value = text;
-        tc.font = { size: 9, italic: true, color: { argb: style.fontColor ?? "FF666666" } };
-        tc.alignment = { horizontal: "left", vertical: "middle", wrapText: true };
-        ws.mergeCells(row.number, sc, row.number, sc + 4);
-
-        const ac = row.getCell(totalCol(vi));
-        ac.value = amount ?? "-";
-        ac.numFmt = MONEY_FMT;
-        ac.font = { bold: !!style.bold, color: style.fontColor ? { argb: style.fontColor } : undefined };
-        ac.alignment = { horizontal: "right", vertical: "middle" };
-      });
-      // The text cell spans roughly 55 characters at this font size — grow the row to fit.
-      row.height = Math.max(row.height ?? 16, Math.ceil(longestText / 55) * 12 + 4);
-      return row;
-    };
-
-    addAmountRow("Items Subtotal", (b) => ({ text: "", amount: b.itemsSubtotal }), { bold: true });
-
-    for (const key of ["designingCharges", "freight", "installation"] as const) {
-      addAmountRow(CHARGE_LABELS[key], (b) => {
-        const line = b.lines.find((l) => l.key === key)!;
-        if (line.itemisedAmount > 0) return { text: `Already listed as an item above (${rupees(line.itemisedAmount)})`, amount: null };
-        if (line.waived) return { text: `${line.basis} — no charge`, amount: 0 };
-        if (!line.basis) return { text: "Not stated", amount: null };
-        return { text: line.basis, amount: line.amount };
-      });
-    }
-
-    addAmountRow("Total before GST", (b) => ({ text: "", amount: b.taxableValue }), { bold: true, fill: GRAY_FILL });
-
-    addAmountRow("GST", (b) => {
-      if (b.gst.included) return { text: `${b.gst.basis} — already included in the prices above, nothing added`, amount: 0 };
-      if (b.gst.rate != null) return { text: `${b.gst.rate}% of ${rupees(b.taxableValue)} (calculated)`, amount: b.gst.amount };
-      if (b.gst.basis) return { text: `${b.gst.basis} — amount as stated by vendor, rate unknown`, amount: b.gst.amount };
-      return { text: "GST not stated — NOT included in the total below", amount: null };
-    }, { bold: true });
-
-    ws.addRow([]).height = 6;
-
-    // Grand total
     const gtRow = ws.addRow([]);
     gtRow.height = 22;
 
@@ -573,13 +572,45 @@ router.get("/projects/:id/export", async (req, res) => {
     doneVendors.forEach((_v, vi) => {
       const sc = vendorStartCol(vi);
       const cell = gtRow.getCell(sc);
-      cell.value = breakdowns.get(_v.id)?.grandTotal ?? "";
+      cell.value = resolutions.get(_v.id)?.grandTotal ?? "";
       cell.numFmt = MONEY_FMT;
       cell.font  = { bold: true, size: 11, color: { argb: WHITE } };
       cell.fill  = { type: "pattern", pattern: "solid", fgColor: { argb: DARK_BLUE } };
       cell.alignment = { horizontal: "right", vertical: "middle" };
       cell.border = allBorders;
       ws.mergeCells(gtRow.number, sc, gtRow.number, sc + NUM_DATA_COLS - 1);
+    });
+
+    // How the grand total is made up, and whether the GST rate was the vendor's or our assumption
+    const breakdownRow = ws.addRow([]);
+    breakdownRow.height = 28;
+    const bdLabel = breakdownRow.getCell(CAT_COL);
+    bdLabel.value = "Made up of";
+    bdLabel.font = { italic: true, bold: true };
+    bdLabel.border = allBorders;
+
+    doneVendors.forEach((_v, vi) => {
+      const sc = vendorStartCol(vi);
+      const res = resolutions.get(_v.id);
+      const cell = breakdownRow.getCell(sc);
+      cell.alignment = { horizontal: "left", vertical: "middle", wrapText: true };
+      cell.border = allBorders;
+      cell.font = { size: 9 };
+      if (res) {
+        const parts = [`Items ${rupees(res.baseTotal)}`];
+        if (res.freightTotal > 0) parts.push(`Freight ${rupees(res.freightTotal)}`);
+        if (res.otherTotal > 0) parts.push(`Other charges ${rupees(res.otherTotal)}`);
+        parts.push(`GST ${rupees(res.gstTotal)}`);
+        let text = parts.join(" + ");
+        if (res.charges.gst.assumed) {
+          text += `\nGST not stated by vendor — standard ${res.charges.gst.rate}% assumed`;
+          cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: AMBER_FILL } };
+        } else if (res.charges.gst.included) {
+          text += "\nVendor's prices already include GST";
+        }
+        cell.value = text;
+      }
+      ws.mergeCells(breakdownRow.number, sc, breakdownRow.number, sc + NUM_DATA_COLS - 1);
     });
 
     // Cross-check against the total the vendor printed on their own document
@@ -592,15 +623,16 @@ router.get("/projects/:id/export", async (req, res) => {
 
     doneVendors.forEach((_v, vi) => {
       const sc = vendorStartCol(vi);
-      const calc = breakdowns.get(_v.id)?.grandTotal;
-      const vendorTotal = stated.get(_v.id)?.grandTotal ?? null;
+      const calc = resolutions.get(_v.id)?.grandTotal;
+      const parsed = _v.parsedData ? (JSON.parse(_v.parsedData) as ParsedQuotation) : null;
+      const vendorTotal = parsed?.grandTotal ?? null;
       const cell = checkRow.getCell(sc);
       cell.alignment = { horizontal: "left", vertical: "middle", wrapText: true };
       cell.border = allBorders;
       cell.font = { size: 9 };
       if (calc == null || vendorTotal == null) {
         cell.value = "Vendor's own total not available to compare";
-      } else if (Math.abs(calc - vendorTotal) < 1) {
+      } else if (Math.abs(calc - vendorTotal) <= TOTAL_TOLERANCE) {
         cell.value = `✓ Matches the vendor's quoted total (${rupees(vendorTotal)})`;
         cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: GREEN_FILL } };
       } else {
@@ -619,7 +651,10 @@ router.get("/projects/:id/export", async (req, res) => {
       ws.getColumn(mrpCol(vi)).width = 12;
       ws.getColumn(unitCol(vi)).width = 14;
       ws.getColumn(discCol(vi)).width = 9;
-      ws.getColumn(totalCol(vi)).width = 14;
+      ws.getColumn(gstCol(vi)).width = 8;
+      ws.getColumn(freightCol(vi)).width = 12;
+      ws.getColumn(otherCol(vi)).width = 12;
+      ws.getColumn(totalCol(vi)).width = 16;
       customColumns.forEach((_c, ci) => { ws.getColumn(customCol(vi, ci)).width = 12; });
       ws.getColumn(vendorStartCol(vi) + NUM_DATA_COLS).width = 2; // gap
     }
